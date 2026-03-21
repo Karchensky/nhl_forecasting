@@ -1,0 +1,74 @@
+nhl_api:
+  base_url: "https://api-web.nhle.com/v1"
+  stats_url: "https://api.nhle.com/stats/rest/en"
+  request_delay: 1.0
+  max_retries: 3
+  retry_backoff: 2.0
+
+odds_api:
+  base_url: "https://api.the-odds-api.com/v4"
+  api_key: ""  # Set via ODDS_API_KEY env var
+  sport: "icehockey_nhl"
+  regions: "us"
+  bookmakers: "fanduel"
+  markets: "player_goal_scorer_anytime"
+
+database:
+  sqlite_path: "data/nhl_forecasting.db"
+  echo: false
+
+seasons:
+  - 20202021
+  - 20212022
+  - 20222023
+  - 20232024
+  - 20242025
+  - 20252026
+
+model:
+  train_seasons:
+    - 20202021
+    - 20212022
+    - 20222023
+    - 20232024
+  validation_season: 20242025
+  test_season: 20252026
+  rolling_windows:
+    - 5
+    - 10
+    - 20
+
+teams:
+  - ANA
+  - ARI
+  - BOS
+  - BUF
+  - CGY
+  - CAR
+  - CHI
+  - COL
+  - CBJ
+  - DAL
+  - DET
+  - EDM
+  - FLA
+  - LAK
+  - MIN
+  - MTL
+  - NSH
+  - NJD
+  - NYI
+  - NYR
+  - OTT
+  - PHI
+  - PIT
+  - SJS
+  - SEA
+  - STL
+  - TBL
+  - TOR
+  - UTA
+  - VAN
+  - VGK
+  - WPG
+  - WSH

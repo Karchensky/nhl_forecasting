@@ -1,0 +1,180 @@
+from datetime import date, datetime
+
+from sqlalchemy import (
+    Boolean,
+    Column,
+    Date,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    UniqueConstraint,
+)
+from sqlalchemy.orm import DeclarativeBase, relationship
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Team(Base):
+    __tablename__ = "teams"
+
+    team_id = Column(Integer, primary_key=True)
+    abbreviation = Column(String(3), nullable=False, index=True)
+    full_name = Column(String(100), nullable=False)
+    conference = Column(String(50))
+    division = Column(String(50))
+
+    players = relationship("Player", back_populates="team")
+
+
+class Player(Base):
+    __tablename__ = "players"
+
+    player_id = Column(Integer, primary_key=True)
+    full_name = Column(String(100), nullable=False)
+    position = Column(String(5))
+    birth_date = Column(Date)
+    shoots = Column(String(1))
+    current_team_id = Column(Integer, ForeignKey("teams.team_id"))
+    height_inches = Column(Integer)
+    weight_lbs = Column(Integer)
+    active = Column(Boolean, default=True)
+
+    team = relationship("Team", back_populates="players")
+
+
+class Game(Base):
+    __tablename__ = "games"
+
+    game_id = Column(Integer, primary_key=True)
+    season = Column(Integer, nullable=False, index=True)
+    game_type = Column(Integer, nullable=False)
+    game_date = Column(Date, nullable=False, index=True)
+    home_team_id = Column(Integer, ForeignKey("teams.team_id"), nullable=False)
+    away_team_id = Column(Integer, ForeignKey("teams.team_id"), nullable=False)
+    home_score = Column(Integer)
+    away_score = Column(Integer)
+    game_state = Column(String(10))
+    venue = Column(String(100))
+
+    home_team = relationship("Team", foreign_keys=[home_team_id])
+    away_team = relationship("Team", foreign_keys=[away_team_id])
+
+
+class PlayerGameStats(Base):
+    __tablename__ = "player_game_stats"
+
+    player_id = Column(Integer, ForeignKey("players.player_id"), primary_key=True)
+    game_id = Column(Integer, ForeignKey("games.game_id"), primary_key=True)
+    team_id = Column(Integer, ForeignKey("teams.team_id"), nullable=False)
+    goals = Column(Integer, default=0)
+    assists = Column(Integer, default=0)
+    points = Column(Integer, default=0)
+    shots = Column(Integer, default=0)
+    hits = Column(Integer, default=0)
+    blocked_shots = Column(Integer, default=0)
+    pim = Column(Integer, default=0)
+    plus_minus = Column(Integer, default=0)
+    toi_seconds = Column(Integer, default=0)
+    pp_toi_seconds = Column(Integer, default=0)
+    sh_toi_seconds = Column(Integer, default=0)
+    ev_toi_seconds = Column(Integer, default=0)
+    pp_goals = Column(Integer, default=0)
+    sh_goals = Column(Integer, default=0)
+    gw_goals = Column(Integer, default=0)
+    ot_goals = Column(Integer, default=0)
+    faceoff_wins = Column(Integer, default=0)
+    faceoff_losses = Column(Integer, default=0)
+    takeaways = Column(Integer, default=0)
+    giveaways = Column(Integer, default=0)
+
+    player = relationship("Player")
+    game = relationship("Game")
+    team = relationship("Team")
+
+
+class GoalieGameStats(Base):
+    __tablename__ = "goalie_game_stats"
+
+    player_id = Column(Integer, ForeignKey("players.player_id"), primary_key=True)
+    game_id = Column(Integer, ForeignKey("games.game_id"), primary_key=True)
+    team_id = Column(Integer, ForeignKey("teams.team_id"), nullable=False)
+    decision = Column(String(5))
+    saves = Column(Integer, default=0)
+    shots_against = Column(Integer, default=0)
+    goals_against = Column(Integer, default=0)
+    save_pct = Column(Float)
+    toi_seconds = Column(Integer, default=0)
+    pp_saves = Column(Integer, default=0)
+    sh_saves = Column(Integer, default=0)
+    ev_saves = Column(Integer, default=0)
+    started = Column(Boolean, default=False)
+
+    player = relationship("Player")
+    game = relationship("Game")
+    team = relationship("Team")
+
+
+class TeamGameStats(Base):
+    __tablename__ = "team_game_stats"
+
+    team_id = Column(Integer, ForeignKey("teams.team_id"), primary_key=True)
+    game_id = Column(Integer, ForeignKey("games.game_id"), primary_key=True)
+    goals = Column(Integer, default=0)
+    shots = Column(Integer, default=0)
+    pim = Column(Integer, default=0)
+    pp_goals = Column(Integer, default=0)
+    pp_opportunities = Column(Integer, default=0)
+    faceoff_win_pct = Column(Float)
+    blocked_shots = Column(Integer, default=0)
+    hits = Column(Integer, default=0)
+    takeaways = Column(Integer, default=0)
+    giveaways = Column(Integer, default=0)
+    is_home = Column(Boolean, nullable=False)
+    won = Column(Boolean)
+
+    team = relationship("Team")
+    game = relationship("Game")
+
+
+class Odds(Base):
+    __tablename__ = "odds"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    player_id = Column(Integer, ForeignKey("players.player_id"), nullable=False)
+    game_id = Column(Integer, ForeignKey("games.game_id"), nullable=False)
+    sportsbook = Column(String(50), nullable=False)
+    market = Column(String(50), nullable=False)
+    american_odds = Column(Integer, nullable=False)
+    implied_probability = Column(Float, nullable=False)
+    retrieved_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("player_id", "game_id", "sportsbook", "market",
+                         name="uq_odds_player_game_book_market"),
+    )
+
+    player = relationship("Player")
+    game = relationship("Game")
+
+
+class ModelOutput(Base):
+    __tablename__ = "model_outputs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    player_id = Column(Integer, ForeignKey("players.player_id"), nullable=False)
+    game_id = Column(Integer, ForeignKey("games.game_id"), nullable=False)
+    model_version = Column(String(50), nullable=False)
+    predicted_probability = Column(Float, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("player_id", "game_id", "model_version",
+                         name="uq_model_output_player_game_version"),
+    )
+
+    player = relationship("Player")
+    game = relationship("Game")

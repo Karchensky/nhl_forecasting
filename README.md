@@ -1,2 +1,0 @@
-# nhl_forecasting
-

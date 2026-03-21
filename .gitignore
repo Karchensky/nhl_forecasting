@@ -179,3 +179,12 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Project-specific
+data/*.db
+data/*.db-journal
+data/*.csv
+models/saved/
+*.pkl
+*.joblib
+config/settings_local.yaml
