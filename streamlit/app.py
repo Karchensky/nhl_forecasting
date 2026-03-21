@@ -5,25 +5,19 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from sqlalchemy import text
-
 from database.db_client import get_engine, init_db
 from models.evaluation import (
     calibration_table,
-    compare_models,
     compute_core_metrics,
-    evaluate_model,
     lift_table,
 )
 
 st.set_page_config(
     page_title="NHL Goal Probability Model",
-    page_icon="🏒",
     layout="wide",
 )
 
@@ -93,38 +87,75 @@ def predictions_view():
         st.info("No predictions available yet. Run the model training pipeline first.")
         return
 
-    model_versions = preds["model_version"].unique().tolist()
-    selected_model = st.selectbox("Model Version", model_versions,
-                                  index=model_versions.index("lightgbm")
-                                  if "lightgbm" in model_versions else 0)
-
-    filtered = preds[preds["model_version"] == selected_model].copy()
-
-    if "game_date" in filtered.columns:
-        filtered["game_date"] = pd.to_datetime(filtered["game_date"])
-        dates = sorted(filtered["game_date"].dt.date.unique(), reverse=True)
+    work = preds.copy()
+    if "game_date" in work.columns:
+        work["game_date"] = pd.to_datetime(work["game_date"])
+        dates = sorted(work["game_date"].dt.date.unique(), reverse=True)
         if dates:
             selected_date = st.selectbox("Game Date", dates)
-            filtered = filtered[filtered["game_date"].dt.date == selected_date]
+            work = work[work["game_date"].dt.date == selected_date]
+
+    id_cols = [
+        "player_id", "game_id", "player_name", "player_team",
+        "home_team", "away_team", "position", "game_date",
+    ]
+    index_cols = [c for c in id_cols if c in work.columns]
+    model_versions = sorted(work["model_version"].unique().tolist())
+
+    wide = work.pivot_table(
+        index=index_cols,
+        columns="model_version",
+        values="predicted_probability",
+        aggfunc="first",
+    ).reset_index()
+    wide.columns.name = None
+
+    prob_cols = [c for c in model_versions if c in wide.columns]
+    if prob_cols:
+        row_max = wide[prob_cols].max(axis=1)
+    else:
+        row_max = pd.Series(0.0, index=wide.index)
 
     min_prob = st.slider("Minimum Probability (%)", 0, 100, 10) / 100.0
-    filtered = filtered[filtered["predicted_probability"] >= min_prob]
+    wide = wide[row_max >= min_prob]
 
-    display_cols = ["player_name", "player_team", "home_team", "away_team",
-                    "predicted_probability", "position", "game_date"]
-    display = filtered[[c for c in display_cols if c in filtered.columns]].copy()
-    if "predicted_probability" in display.columns:
-        display["predicted_probability"] = (display["predicted_probability"] * 100).round(1)
-        display = display.rename(columns={"predicted_probability": "Goal Prob (%)"})
+    display = wide.copy()
+    rename_map = {}
+    for c in prob_cols:
+        short = {
+            "logistic_regression": "LR %",
+            "lightgbm": "LightGBM %",
+            "xgboost": "XGBoost %",
+        }.get(c, f"{c} %")
+        rename_map[c] = short
+        display[c] = (display[c] * 100).round(1)
+    display = display.rename(columns=rename_map)
 
-    st.dataframe(display, use_container_width=True, hide_index=True)
+    sort_col = "LightGBM %" if "LightGBM %" in display.columns else (
+        list(rename_map.values())[0] if rename_map else None
+    )
+    if sort_col:
+        display = display.sort_values(sort_col, ascending=False)
 
-    if not filtered.empty:
-        fig = px.histogram(filtered, x="predicted_probability", nbins=30,
-                           title="Prediction Distribution")
-        fig.update_xaxes(title="Predicted Probability")
-        fig.update_yaxes(title="Count")
-        st.plotly_chart(fig, use_container_width=True)
+    show_cols = [c for c in display.columns if c not in ("player_id", "game_id")]
+    st.dataframe(display[show_cols], width="stretch", hide_index=True)
+
+    if not wide.empty and prob_cols:
+        fig = go.Figure()
+        for c in prob_cols:
+            fig.add_trace(go.Histogram(
+                x=wide[c].dropna(),
+                name=c.replace("_", " "),
+                opacity=0.55,
+                nbinsx=30,
+            ))
+        fig.update_layout(
+            title="Prediction distribution by model",
+            barmode="overlay",
+            xaxis_title="Predicted probability",
+            yaxis_title="Count",
+        )
+        st.plotly_chart(fig, width="stretch")
 
 
 def value_view():
@@ -186,7 +217,7 @@ def value_view():
     col2.metric("+EV Opportunities", n_positive)
     col3.metric("Avg Edge", f"{value_bets['edge_pct'].mean():.1f}%" if not value_bets.empty else "N/A")
 
-    st.dataframe(display, use_container_width=True, hide_index=True)
+    st.dataframe(display, width="stretch", hide_index=True)
 
 
 def diagnostics_view():
@@ -237,13 +268,13 @@ def diagnostics_view():
                 xaxis_title="Mean Predicted Probability",
                 yaxis_title="Actual Scoring Rate",
             )
-            st.plotly_chart(fig_cal, use_container_width=True)
+            st.plotly_chart(fig_cal, width="stretch")
 
             st.subheader("Calibration Table")
             cal_display = cal.copy()
             cal_display["actual_rate"] = (cal_display["actual_rate"] * 100).round(2)
             cal_display["predicted_mean"] = (cal_display["predicted_mean"] * 100).round(2)
-            st.dataframe(cal_display, use_container_width=True, hide_index=True)
+            st.dataframe(cal_display, width="stretch", hide_index=True)
 
             st.subheader("Lift Chart")
             lift = lift_table(y_true, y_prob)
@@ -252,14 +283,14 @@ def diagnostics_view():
             fig_lift.add_hline(y=1.0, line_dash="dash", line_color="gray")
             fig_lift.update_xaxes(title="Decile")
             fig_lift.update_yaxes(title="Lift vs. Base Rate")
-            st.plotly_chart(fig_lift, use_container_width=True)
+            st.plotly_chart(fig_lift, width="stretch")
 
             st.subheader("Cumulative Gains")
             fig_gains = px.line(lift, x="decile", y="cumulative_actual",
                                 title="Cumulative Gains Chart")
             fig_gains.update_xaxes(title="Decile")
             fig_gains.update_yaxes(title="Cumulative % of Goals Captured")
-            st.plotly_chart(fig_gains, use_container_width=True)
+            st.plotly_chart(fig_gains, width="stretch")
         else:
             st.warning("No overlapping predictions and results for evaluation.")
 
@@ -278,7 +309,7 @@ def diagnostics_view():
 
 
 def main():
-    st.title("🏒 NHL Goal Probability Model")
+    st.title("NHL Goal Probability Model")
 
     init_db()
 

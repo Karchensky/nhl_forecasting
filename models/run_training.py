@@ -10,6 +10,7 @@ from models.training import (
     train_logistic_baseline,
     train_lightgbm,
     train_xgboost,
+    tune_lightgbm,
 )
 from models.evaluation import evaluate_model, compare_models
 from utils.logger import get_logger
@@ -18,6 +19,9 @@ logger = get_logger("run_training")
 
 
 def main():
+    do_tune = "--no-tune" not in sys.argv
+    n_trials = 50
+
     logger.info("=== Building Feature Matrix ===")
     df = build_feature_matrix()
     feature_cols = get_feature_columns(df)
@@ -30,6 +34,15 @@ def main():
         logger.error("Not enough training data (%d rows). Need more boxscores.", len(train))
         return
 
+    tuned_params = {}
+    if do_tune:
+        logger.info("\n=== Optuna Hyperparameter Tuning ===")
+        import pandas as pd
+        train_val = pd.concat([train, val], ignore_index=True)
+        tuned_params = tune_lightgbm(
+            train_val, feature_cols, n_trials=n_trials, n_folds=5
+        )
+
     logger.info("\n=== Training Models ===")
     results = {}
 
@@ -37,7 +50,9 @@ def main():
     results["lr"] = train_logistic_baseline(train, val, feature_cols)
 
     logger.info("\n--- LightGBM ---")
-    results["lgb"] = train_lightgbm(train, val, feature_cols)
+    results["lgb"] = train_lightgbm(
+        train, val, feature_cols, tuned_params=tuned_params
+    )
 
     logger.info("\n--- XGBoost ---")
     results["xgb"] = train_xgboost(train, val, feature_cols)

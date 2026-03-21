@@ -126,6 +126,8 @@ def fetch_and_store_odds(game_id_lookup: dict = None, player_id_lookup: dict = N
     game_id_lookup: maps 'away @ home' style key -> game_id
     player_id_lookup: maps lowercase player name -> player_id
     """
+    import time as _time
+
     client = OddsApiClient()
     events = client.get_events()
 
@@ -135,25 +137,34 @@ def fetch_and_store_odds(game_id_lookup: dict = None, player_id_lookup: dict = N
 
     logger.info("Found %d upcoming events", len(events))
 
+    if not player_id_lookup or not game_id_lookup:
+        logger.warning("No game_id_lookup or player_id_lookup provided; cannot store odds.")
+        return
+
     for event in events:
         event_id = event.get("id")
         if not event_id:
             continue
 
+        home = event.get("home_team", "")
+        away = event.get("away_team", "")
+        key = f"{away} @ {home}"
+        game_id = game_id_lookup.get(key)
+
+        if not game_id:
+            logger.debug("No game_id found for %s, skipping.", key)
+            continue
+
+        _time.sleep(1.5)
         odds_data = client.get_player_goal_odds(event_id)
         if not odds_data:
             continue
 
-        if player_id_lookup and game_id_lookup:
-            home = event.get("home_team", "")
-            away = event.get("away_team", "")
-            key = f"{away} @ {home}"
-            game_id = game_id_lookup.get(key)
-
-            if game_id:
-                records = parse_player_goal_odds(odds_data, game_id, player_id_lookup)
-                if records:
-                    with get_session() as session:
-                        for r in records:
-                            upsert_odds(session, r)
-                    logger.info("Stored %d odds for game %s", len(records), game_id)
+        records = parse_player_goal_odds(odds_data, game_id, player_id_lookup)
+        if records:
+            with get_session() as session:
+                for r in records:
+                    upsert_odds(session, r)
+            logger.info("Stored %d odds for game %s (%s)", len(records), game_id, key)
+        else:
+            logger.debug("No matching players for game %s (%s)", game_id, key)

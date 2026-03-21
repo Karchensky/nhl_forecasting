@@ -51,22 +51,32 @@ def predict_with_model(model_name: str, df: pd.DataFrame) -> pd.DataFrame:
 
 
 def predict_upcoming(model_name: str = "lightgbm") -> pd.DataFrame:
-    """Predict goal probabilities for upcoming/today's games."""
+    """Predict goal probabilities for upcoming/today's games.
+
+    Builds features for the current season (completed games provide the
+    rolling history) and then generates predictions for all rows, including
+    any upcoming games that have been ingested into the games table.
+    """
     from utils.config import load_config
+    from models.feature_engineering import build_feature_matrix_with_upcoming
+
     cfg = load_config()
     test_season = cfg["model"]["test_season"]
 
-    logger.info("Building features for season %d...", test_season)
-    df = build_feature_matrix(seasons=[test_season])
+    logger.info("Building features for season %d (with upcoming)...", test_season)
+    try:
+        df = build_feature_matrix_with_upcoming(seasons=[test_season])
+    except Exception:
+        logger.info("Falling back to standard feature matrix...")
+        df = build_feature_matrix(seasons=[test_season])
 
     if df.empty:
         logger.warning("No data for season %d", test_season)
         return pd.DataFrame()
 
     today = date.today()
-    future_mask = df["game_date"] >= pd.Timestamp(today)
-    if future_mask.any():
-        logger.info("Found %d future game-player rows", future_mask.sum())
+    logger.info("Total rows: %d, date range: %s to %s",
+                len(df), df["game_date"].min(), df["game_date"].max())
 
     predictions = predict_with_model(model_name, df)
     return predictions

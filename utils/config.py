@@ -6,6 +6,15 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = PROJECT_ROOT / "config" / "settings.yaml"
 
+try:
+    from dotenv import load_dotenv
+
+    _env_path = PROJECT_ROOT / ".env"
+    if _env_path.exists():
+        load_dotenv(_env_path, encoding="utf-8-sig")
+except ImportError:
+    pass
+
 
 def load_config() -> dict:
     with open(CONFIG_PATH, "r") as f:
