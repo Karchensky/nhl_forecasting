@@ -54,10 +54,10 @@ class OddsApiClient:
             logger.error("Failed to fetch events: %s", e)
             return []
 
-    def get_player_goal_odds(self, event_id: str) -> list[dict]:
-        """Get player anytime goal scorer odds for a specific event."""
+    def get_player_goal_odds(self, event_id: str) -> dict | list:
+        """Event odds payload: usually a dict; some responses wrap a list."""
         if not self._check_api_key():
-            return []
+            return {}
 
         url = f"{self.base_url}/sports/{self.sport}/events/{event_id}/odds"
         params = {
@@ -74,7 +74,7 @@ class OddsApiClient:
             return resp.json()
         except requests.exceptions.RequestException as e:
             logger.error("Failed to fetch player odds for %s: %s", event_id, e)
-            return []
+            return {}
 
 
 def american_to_implied(odds: int) -> float:
@@ -85,14 +85,26 @@ def american_to_implied(odds: int) -> float:
         return 100 / (odds + 100)
 
 
-def parse_player_goal_odds(event_data: dict, game_id: int,
-                           player_id_lookup: dict) -> list[dict]:
-    """Parse player goal odds from The Odds API response into DB records.
+def _event_payload(data) -> dict:
+    """Odds API may return a dict or a one-element list for event odds."""
+    if isinstance(data, list):
+        return data[0] if data else {}
+    return data if isinstance(data, dict) else {}
 
-    player_id_lookup: maps lowercase player name -> player_id
-    """
+
+def parse_player_goal_odds(
+    event_data,
+    game_id: int,
+    player_id_lookup: dict,
+    player_lookup_keys: list[str] | None = None,
+) -> list[dict]:
+    """Parse player goal odds from The Odds API response into DB records."""
+    from scrapers.external.odds_matching import resolve_player_id
+
+    event_data = _event_payload(event_data)
     records = []
     bookmakers = event_data.get("bookmakers", [])
+    keys = player_lookup_keys or sorted(player_id_lookup.keys())
 
     for book in bookmakers:
         book_key = book.get("key", "unknown")
@@ -102,9 +114,12 @@ def parse_player_goal_odds(event_data: dict, game_id: int,
             for outcome in market.get("outcomes", []):
                 name = outcome.get("description", outcome.get("name", ""))
                 price = outcome.get("price", 0)
+                if not name or price == 0:
+                    continue
 
-                name_lower = name.lower().strip()
-                player_id = player_id_lookup.get(name_lower)
+                player_id = resolve_player_id(
+                    name, player_id_lookup, keys, fuzzy_cutoff=0.91
+                )
 
                 if player_id and price != 0:
                     records.append({
@@ -112,21 +127,28 @@ def parse_player_goal_odds(event_data: dict, game_id: int,
                         "game_id": game_id,
                         "sportsbook": book_key,
                         "market": "anytime_goal_scorer",
-                        "american_odds": price,
-                        "implied_probability": american_to_implied(price),
+                        "american_odds": int(price),
+                        "implied_probability": american_to_implied(int(price)),
                         "retrieved_at": datetime.utcnow(),
                     })
 
     return records
 
 
-def fetch_and_store_odds(game_id_lookup: dict = None, player_id_lookup: dict = None):
+def fetch_and_store_odds(
+    game_id_lookup: dict = None,
+    player_id_lookup: dict = None,
+    player_lookup_keys: list[str] | None = None,
+):
     """Fetch today's odds and store them.
 
-    game_id_lookup: maps 'away @ home' style key -> game_id
-    player_id_lookup: maps lowercase player name -> player_id
+    game_id_lookup: maps 'away @ home' style key -> game_id (multiple variants per game)
+    player_id_lookup: normalized / lowercase player name -> player_id
+    player_lookup_keys: sorted keys for difflib fuzzy matching (from daily_job)
     """
     import time as _time
+
+    from scrapers.external.odds_matching import resolve_game_id
 
     client = OddsApiClient()
     events = client.get_events()
@@ -141,30 +163,56 @@ def fetch_and_store_odds(game_id_lookup: dict = None, player_id_lookup: dict = N
         logger.warning("No game_id_lookup or player_id_lookup provided; cannot store odds.")
         return
 
+    pkeys = player_lookup_keys or sorted(player_id_lookup.keys())
+    total_stored = 0
+    skipped_events = []
+
     for event in events:
         event_id = event.get("id")
         if not event_id:
             continue
 
-        home = event.get("home_team", "")
-        away = event.get("away_team", "")
-        key = f"{away} @ {home}"
-        game_id = game_id_lookup.get(key)
+        home = event.get("home_team", "") or ""
+        away = event.get("away_team", "") or ""
+        game_id = resolve_game_id(away, home, game_id_lookup)
 
         if not game_id:
-            logger.debug("No game_id found for %s, skipping.", key)
+            skipped_events.append(f"{away} @ {home}")
             continue
 
         _time.sleep(1.5)
         odds_data = client.get_player_goal_odds(event_id)
         if not odds_data:
+            logger.warning("Empty odds payload for event %s (%s @ %s)", event_id, away, home)
             continue
 
-        records = parse_player_goal_odds(odds_data, game_id, player_id_lookup)
+        records = parse_player_goal_odds(
+            odds_data, game_id, player_id_lookup, pkeys
+        )
+        slate_key = f"{away} @ {home}"
         if records:
             with get_session() as session:
                 for r in records:
                     upsert_odds(session, r)
-            logger.info("Stored %d odds for game %s (%s)", len(records), game_id, key)
+            total_stored += len(records)
+            logger.info("Stored %d odds for game %s (%s)", len(records), game_id, slate_key)
         else:
-            logger.debug("No matching players for game %s (%s)", game_id, key)
+            logger.warning(
+                "No player-name matches for game %s (%s); check Odds API names vs. "
+                "players.full_name in DB.",
+                game_id,
+                slate_key,
+            )
+
+    if total_stored == 0:
+        logger.warning(
+            "Odds fetch finished with 0 stored rows — check team strings vs DB "
+            "(Montréal/Montreal, Utah names) or player names vs players.full_name."
+        )
+        if skipped_events:
+            logger.warning(
+                "Events with no DB game match (first 5): %s",
+                skipped_events[:5],
+            )
+    else:
+        logger.info("Total odds rows upserted this run: %d", total_stored)

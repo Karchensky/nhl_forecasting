@@ -9,6 +9,8 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from sqlalchemy import text as sa_text
+
 from database.db_client import get_engine, init_db
 from models.evaluation import (
     calibration_table,
@@ -42,6 +44,16 @@ def load_predictions():
         ORDER BY mo.predicted_probability DESC
     """
     return pd.read_sql(query, engine)
+
+
+def odds_table_row_count() -> int | None:
+    """Raw count in ``odds`` (helps debug empty API / upsert issues)."""
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            return int(conn.execute(sa_text("SELECT COUNT(*) FROM odds")).scalar() or 0)
+    except Exception:
+        return None
 
 
 @st.cache_data(ttl=300)
@@ -168,9 +180,23 @@ def value_view():
         st.info("No predictions available.")
         return
     if odds.empty:
+        n_db = odds_table_row_count()
+        hint = ""
+        if n_db is not None and n_db > 0:
+            hint = (
+                f" The database has **{n_db}** odds row(s), but the loaded odds "
+                "dataframe is empty — check DB path vs. this app’s working directory."
+            )
+        elif n_db == 0:
+            hint = (
+                " The `odds` table is **empty**. Typical causes: (1) Odds API player "
+                "names don’t match `players.full_name` in the DB (lookup is exact "
+                "lowercase), or (2) `upsert_odds` failed before the fix — re-run "
+                "`python scheduler/daily_job.py` after pulling the latest code."
+            )
         st.info(
             "No odds data available. Configure your Odds API key and run "
-            "the odds scraper to see value opportunities."
+            "the odds scraper to see value opportunities." + hint
         )
         return
 
@@ -180,12 +206,15 @@ def value_view():
                                   if "lightgbm" in model_versions else 0,
                                   key="value_model")
 
-    merged = preds[preds["model_version"] == selected_model].merge(
-        odds[["player_id", "game_id", "sportsbook", "american_odds",
-              "implied_probability"]],
-        on=["player_id", "game_id"],
-        how="inner",
-    )
+    p = preds[preds["model_version"] == selected_model].copy()
+    o = odds[["player_id", "game_id", "sportsbook", "american_odds",
+              "implied_probability"]].copy()
+    for col in ("player_id", "game_id"):
+        if col in p.columns:
+            p[col] = pd.to_numeric(p[col], errors="coerce").astype("Int64")
+        if col in o.columns:
+            o[col] = pd.to_numeric(o[col], errors="coerce").astype("Int64")
+    merged = p.merge(o, on=["player_id", "game_id"], how="inner")
 
     if merged.empty:
         st.warning("No matching predictions + odds found.")

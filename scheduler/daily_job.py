@@ -173,14 +173,23 @@ def _get_upcoming_game_ids() -> list[int]:
 
 
 def _build_game_id_lookup() -> dict:
-    """Build mapping from 'Away Team @ Home Team' -> game_id for today/tomorrow."""
+    """Build mapping from many 'Away @ Home' variants -> game_id (today/tomorrow).
+
+    Includes full names, abbreviations, and accent-normalized keys for Odds API matching.
+    """
+    from scrapers.external.odds_matching import build_game_id_lookup_from_rows
+
     today = date.today()
     tomorrow = today + timedelta(days=1)
     engine = get_engine()
     with engine.connect() as conn:
         rows = conn.execute(
             sa_text("""
-                SELECT g.game_id, at.full_name as away_name, ht.full_name as home_name
+                SELECT g.game_id,
+                       at.full_name AS away_name,
+                       ht.full_name AS home_name,
+                       at.abbreviation AS away_abbr,
+                       ht.abbreviation AS home_abbr
                 FROM games g
                 JOIN teams at ON g.away_team_id = at.team_id
                 JOIN teams ht ON g.home_team_id = ht.team_id
@@ -188,27 +197,26 @@ def _build_game_id_lookup() -> dict:
             """),
             {"today": str(today), "tomorrow": str(tomorrow)},
         ).fetchall()
-    lookup = {}
-    for game_id, away_name, home_name in rows:
-        lookup[f"{away_name} @ {home_name}"] = game_id
-    return lookup
+    return build_game_id_lookup_from_rows(rows)
 
 
-def _build_player_id_lookup() -> dict:
-    """Build mapping from lowercase player name -> player_id."""
+def _build_player_id_lookup() -> tuple[dict, list[str]]:
+    """Exact + normalized player keys, plus sorted key list for fuzzy Odds API names."""
+    from scrapers.external.odds_matching import build_player_id_lookup
+
     engine = get_engine()
     with engine.connect() as conn:
         rows = conn.execute(
             sa_text("SELECT player_id, full_name FROM players WHERE active = 1")
         ).fetchall()
-    return {name.lower().strip(): pid for pid, name in rows}
+    return build_player_id_lookup(list(rows))
 
 
 def run_predictions():
     """Generate predictions for today/tomorrow using enriched features + saved models."""
     from models.inference import predict_upcoming, store_predictions
 
-    logger.info("Generating predictions for today + tomorrow (all models)...")
+    logger.info("Generating predictions for today's games (all models)...")
     try:
         for model_name in ("logistic_regression", "lightgbm", "xgboost"):
             preds = predict_upcoming(model_name=model_name)
@@ -235,18 +243,22 @@ def fetch_odds():
             return
 
         game_id_lookup = _build_game_id_lookup()
-        player_id_lookup = _build_player_id_lookup()
+        player_id_lookup, player_lookup_keys = _build_player_id_lookup()
 
         if not game_id_lookup:
             logger.info("No upcoming games found for odds lookup.")
             return
 
+        n_slate = len({gid for gid in game_id_lookup.values()})
         logger.info(
-            "Fetching odds for %d upcoming games...", len(game_id_lookup)
+            "Fetching odds (%d unique games, %d lookup key variants)...",
+            n_slate,
+            len(game_id_lookup),
         )
         fetch_and_store_odds(
             game_id_lookup=game_id_lookup,
             player_id_lookup=player_id_lookup,
+            player_lookup_keys=player_lookup_keys,
         )
     except Exception as e:
         logger.error("Odds fetch failed: %s", e)

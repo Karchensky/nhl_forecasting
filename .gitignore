@@ -136,6 +136,9 @@ ENV/
 env.bak/
 venv.bak/
 
+# reference files
+reference/
+
 # Spyder project settings
 .spyderproject
 .spyproject

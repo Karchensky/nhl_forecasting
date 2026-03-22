@@ -66,13 +66,22 @@ def main():
     logger.info("\n=== Model Comparison ===")
     compare_models(eval_results)
 
-    logger.info("\n=== Feature Importance (LightGBM) ===")
+    logger.info("\n=== Feature Importance (LightGBM gain, top 20) ===")
     lgb_model = results["lgb"]["model"]
     importance = lgb_model.feature_importance(importance_type="gain")
     feat_imp = sorted(zip(feature_cols, importance), key=lambda x: -x[1])
-    print("\nTop 20 features by gain:")
-    for feat, imp in feat_imp[:20]:
+    seen = set()
+    print("\nTop 20 unique features by gain:")
+    n = 0
+    for feat, imp in feat_imp:
+        if feat in seen:
+            continue
+        seen.add(feat)
         print(f"  {feat:40s} {imp:.1f}")
+        n += 1
+        if n >= 20:
+            break
+    logger.info("Full tables: python models/feature_importance_report.py --out docs/feature_importance.md")
 
     logger.info("\nTraining complete!")
 

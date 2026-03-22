@@ -71,10 +71,20 @@ def upsert_team_game_stats(session: Session, data: dict):
 
 
 def upsert_odds(session: Session, data: dict):
-    stmt = sqlite_insert(Odds.__table__).values(**data)
+    """Insert or update by (player_id, game_id, sportsbook, market).
+
+    Must match ``Odds`` unique constraint — **not** ``id`` (autoincrement),
+    or every insert is treated as new and repeats violate the unique index.
+    """
+    clean = {k: v for k, v in data.items() if k != "id"}
+    stmt = sqlite_insert(Odds.__table__).values(**clean)
     stmt = stmt.on_conflict_do_update(
-        index_elements=["id"],
-        set_={k: v for k, v in data.items() if k != "id"},
+        index_elements=["player_id", "game_id", "sportsbook", "market"],
+        set_={
+            "american_odds": clean["american_odds"],
+            "implied_probability": clean["implied_probability"],
+            "retrieved_at": clean["retrieved_at"],
+        },
     )
     session.execute(stmt)
 

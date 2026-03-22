@@ -1,6 +1,6 @@
 """Inference module: generate predictions for upcoming games."""
 
-from datetime import date, datetime, timedelta
+from datetime import date
 
 import numpy as np
 import pandas as pd
@@ -27,7 +27,9 @@ def predict_with_model(model_name: str, df: pd.DataFrame) -> pd.DataFrame:
         scaler = saved["scaler"]
         model = saved["model"]
         X_scaled = scaler.transform(X.values)
-        probs = model.predict_proba(X_scaled)[:, 1]
+        raw_probs = model.predict_proba(X_scaled)[:, 1]
+        calibrator = saved.get("calibrator")
+        probs = calibrator.predict(raw_probs) if calibrator is not None else raw_probs
     elif model_name == "lightgbm":
         model = saved["model"]
         raw_probs = model.predict(X)
@@ -75,21 +77,22 @@ def predict_upcoming(model_name: str = "lightgbm") -> pd.DataFrame:
         return pd.DataFrame()
 
     today = date.today()
-    tomorrow = today + timedelta(days=1)
     logger.info("Total rows: %d, date range: %s to %s",
                 len(df), df["game_date"].min(), df["game_date"].max())
 
     gd = pd.to_datetime(df["game_date"]).dt.normalize()
-    horizon_mask = (gd.dt.date >= today) & (gd.dt.date <= tomorrow)
+    # Today only: avoids scoring tomorrow before tonight's games update rolling
+    # features (same player could play tonight and again tomorrow).
+    horizon_mask = gd.dt.date == today
     df_horizon = df[horizon_mask].copy()
     if df_horizon.empty:
         logger.warning(
-            "No rows for today/tomorrow in season %s; nothing to predict.",
+            "No rows for today's date in season %s; nothing to predict.",
             test_season,
         )
         return pd.DataFrame()
 
-    logger.info("Predicting for %d rows (today + next day only)", len(df_horizon))
+    logger.info("Predicting for %d rows (today's games only)", len(df_horizon))
     predictions = predict_with_model(model_name, df_horizon)
     return predictions
 
