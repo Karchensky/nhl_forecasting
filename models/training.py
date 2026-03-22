@@ -15,7 +15,6 @@ from sklearn.metrics import log_loss, roc_auc_score
 from sklearn.preprocessing import StandardScaler
 
 import lightgbm as lgb
-import optuna
 import xgboost as xgb
 
 from models.feature_engineering import NON_FEATURE_COLS, build_feature_matrix
@@ -56,12 +55,13 @@ def compute_sample_weights(df: pd.DataFrame, half_life_days: int = 365) -> np.nd
 def rolling_window_cv_splits(
     df: pd.DataFrame,
     n_folds: int = 5,
-    min_train_games: int = 500,
+    min_train_rows: int = 30_000,
 ) -> list[tuple[pd.DataFrame, pd.DataFrame]]:
     """Generate temporally ordered train/val splits for rolling-window CV.
 
     Splits are based on game_date ordering. Each fold uses everything before
-    the validation window as training data.
+    the validation window as training data. Folds are skipped if the training
+    partition would be smaller than ``min_train_rows``.
     """
     df = df.sort_values("game_date").reset_index(drop=True)
     unique_dates = sorted(df["game_date"].unique())
@@ -74,9 +74,6 @@ def rolling_window_cv_splits(
         val_start_idx = n_dates - (n_folds - fold) * val_size
         val_end_idx = val_start_idx + val_size
 
-        if val_start_idx < min_train_games:
-            continue
-
         val_start_date = unique_dates[val_start_idx]
         val_end_date = unique_dates[min(val_end_idx, n_dates - 1)]
 
@@ -86,7 +83,7 @@ def rolling_window_cv_splits(
         train_split = df[train_mask].copy()
         val_split = df[val_mask].copy()
 
-        if len(train_split) > 0 and len(val_split) > 0:
+        if len(train_split) >= min_train_rows and len(val_split) > 0:
             splits.append((train_split, val_split))
 
     logger.info("Generated %d rolling-window CV folds", len(splits))
@@ -98,7 +95,7 @@ def rolling_window_cv_splits(
 # ---------------------------------------------------------------------------
 
 def _lgb_optuna_objective(
-    trial: optuna.Trial,
+    trial,
     cv_splits: list[tuple[pd.DataFrame, pd.DataFrame]],
     feature_cols: list[str],
     use_weights: bool = True,
@@ -154,6 +151,8 @@ def tune_lightgbm(
     half_life_days: int = 365,
 ) -> dict:
     """Run Optuna hyperparameter tuning for LightGBM."""
+    import optuna
+
     logger.info("Starting Optuna tuning for LightGBM (%d trials)...", n_trials)
 
     cv_splits = rolling_window_cv_splits(df, n_folds=n_folds)

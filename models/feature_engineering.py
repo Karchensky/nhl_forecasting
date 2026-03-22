@@ -216,12 +216,73 @@ def _team_rolling_features(df: pd.DataFrame, tables: dict, windows: list[int]) -
         tgs[f"team_pp_pct_{w}g"] = np.where(pp_o_sum > 0, pp_g_sum / pp_o_sum, 0.0)
         tgs[f"team_win_pct_{w}g"] = shifted_won.rolling(w, min_periods=1).mean().values
 
+        if "pp_toi_seconds" in tgs.columns:
+            spp = grp["pp_toi_seconds"].shift(1)
+            tgs[f"team_pp_toi_rollsum_{w}g"] = spp.rolling(w, min_periods=1).sum().values
+        if "pp_opportunities_actual" in tgs.columns:
+            spo = grp["pp_opportunities_actual"].shift(1)
+            tgs[f"team_pp_opps_rollsum_{w}g"] = spo.rolling(w, min_periods=1).sum().values
+
     team_feat_cols = [c for c in tgs.columns
                       if c.startswith("team_") and c not in ("team_id",)]
     team_feats = tgs[["team_id", "game_id"] + team_feat_cols].copy()
 
     df = df.merge(team_feats, left_on=["team_id", "game_id"],
                   right_on=["team_id", "game_id"], how="left")
+    return df
+
+
+def _pp_share_of_team_features(df: pd.DataFrame, windows: list[int]) -> pd.DataFrame:
+    """Player's share of team power-play TOI over prior N games (deployment)."""
+    if "pp_toi_seconds" not in df.columns:
+        return df
+
+    df = df.sort_values(["player_id", "game_date", "game_id"]).copy()
+    grp = df.groupby("player_id")
+    new_cols = {}
+    for w in windows:
+        new_cols[f"_player_pp_toi_sum_{w}g"] = (
+            grp["pp_toi_seconds"].shift(1).rolling(w, min_periods=1).sum().values
+        )
+    df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
+
+    for w in windows:
+        tcol = f"team_pp_toi_rollsum_{w}g"
+        pcol = f"_player_pp_toi_sum_{w}g"
+        if tcol not in df.columns:
+            continue
+        df[f"pp_toi_share_of_team_{w}g"] = df[pcol] / np.maximum(
+            df[tcol].fillna(0), 1.0
+        )
+
+    drop_internal = [c for c in df.columns if c.startswith("_player_pp_toi_sum_")]
+    df.drop(columns=drop_internal, inplace=True, errors="ignore")
+    return df
+
+
+def _teammate_strength_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Mean prior scoring rate of teammates in the same game (lineup quality proxy)."""
+    col = "goals_per_60_10g"
+    if col not in df.columns:
+        return df
+
+    gsum = df.groupby(["game_id", "team_id"])[col].transform("sum")
+    gcnt = df.groupby(["game_id", "team_id"])[col].transform("count")
+    denom = np.maximum(gcnt - 1, 1)
+    df["teammate_mean_g60_10g"] = np.where(
+        gcnt > 1, (gsum - df[col]) / denom, 0.0
+    )
+
+    if "shots_per_60_10g" in df.columns:
+        df["player_sh60_x_teammate_g60"] = (
+            df["shots_per_60_10g"].fillna(0) * df["teammate_mean_g60_10g"]
+        )
+
+    if "pp_toi_seconds_avg_10g" in df.columns:
+        df["pp_toi_avg_x_teammate_g60"] = (
+            df["pp_toi_seconds_avg_10g"].fillna(0) * df["teammate_mean_g60_10g"]
+        )
+
     return df
 
 
@@ -326,7 +387,55 @@ def _game_context_features(df: pd.DataFrame) -> pd.DataFrame:
     df.drop(columns=dup_cols, inplace=True)
     df["games_last_7d"] = df["games_last_7d"].fillna(0).astype(int)
 
+    df["game_dow"] = df["game_date"].dt.dayofweek.fillna(3).astype(int)
+
     df.drop(columns=["prev_game_date"], inplace=True)
+    return df
+
+
+def _opponent_schedule_context(df: pd.DataFrame, tables: dict) -> pd.DataFrame:
+    """Opponent team rest, back-to-back, and schedule density (mirror of player context)."""
+    g = tables["games"].copy()
+    g = g[g["game_state"].isin(["FINAL", "OFF"])].copy()
+    if g.empty:
+        df["opponent_rest_days"] = 7.0
+        df["opponent_is_back_to_back"] = 0
+        df["opponent_games_last_7d"] = 0
+        return df
+
+    g["game_date"] = pd.to_datetime(g["game_date"])
+    h = g[["game_date", "home_team_id"]].rename(columns={"home_team_id": "team_id"})
+    aw = g[["game_date", "away_team_id"]].rename(columns={"away_team_id": "team_id"})
+    sched = pd.concat([h, aw], ignore_index=True).drop_duplicates(
+        subset=["team_id", "game_date"]
+    )
+    sched = sched.sort_values(["team_id", "game_date"])
+    sched["prev_dt"] = sched.groupby("team_id")["game_date"].shift(1)
+    sched["opponent_rest_days"] = (
+        (sched["game_date"] - sched["prev_dt"]).dt.days.fillna(7).clip(0, 30)
+    )
+    sched["opponent_is_back_to_back"] = (sched["opponent_rest_days"] <= 1).astype(int)
+
+    opp_dates = sched.sort_values(["team_id", "game_date"])
+    counts = []
+    for _, row in opp_dates.iterrows():
+        mask = (
+            (opp_dates["team_id"] == row["team_id"])
+            & (opp_dates["game_date"] >= row["game_date"] - timedelta(days=7))
+            & (opp_dates["game_date"] < row["game_date"])
+        )
+        counts.append(int(mask.sum()))
+    opp_dates["opponent_games_last_7d"] = counts
+
+    opp_sched = opp_dates.rename(columns={"team_id": "opponent_team_id"})
+    merge_cols = [
+        "opponent_team_id", "game_date", "opponent_rest_days",
+        "opponent_is_back_to_back", "opponent_games_last_7d",
+    ]
+    df = df.merge(opp_sched[merge_cols], on=["opponent_team_id", "game_date"], how="left")
+    df["opponent_rest_days"] = df["opponent_rest_days"].fillna(7.0)
+    df["opponent_is_back_to_back"] = df["opponent_is_back_to_back"].fillna(0).astype(int)
+    df["opponent_games_last_7d"] = df["opponent_games_last_7d"].fillna(0).astype(int)
     return df
 
 
@@ -372,6 +481,33 @@ def _home_road_split_features(df: pd.DataFrame, windows: list[int]) -> pd.DataFr
                 t_sum > 0, g_sum / (t_sum / 3600.0), 0.0
             )
 
+            if "pp_toi_seconds" in df.columns:
+                temp_pp = df[["player_id", "game_date", "pp_toi_seconds"]].copy()
+                temp_pp.loc[~mask, "pp_toi_seconds"] = np.nan
+                gpp = temp_pp.groupby("player_id")
+                spp = gpp["pp_toi_seconds"].shift(1)
+                df[f"{loc_label}_pp_toi_avg_{w}g"] = (
+                    spp.rolling(w, min_periods=1).mean().values
+                )
+
+            if "pp_shots" in df.columns:
+                temp_ps = df[["player_id", "game_date", "pp_shots"]].copy()
+                temp_ps.loc[~mask, "pp_shots"] = np.nan
+                gps = temp_ps.groupby("player_id")
+                sps = gps["pp_shots"].shift(1)
+                df[f"{loc_label}_pp_shots_avg_{w}g"] = (
+                    sps.rolling(w, min_periods=1).mean().values
+                )
+
+            if "total_shot_attempts" in df.columns:
+                temp_tsa = df[["player_id", "game_date", "total_shot_attempts"]].copy()
+                temp_tsa.loc[~mask, "total_shot_attempts"] = np.nan
+                gts = temp_tsa.groupby("player_id")
+                sts = gts["total_shot_attempts"].shift(1)
+                df[f"{loc_label}_shot_attempts_avg_{w}g"] = (
+                    sts.rolling(w, min_periods=1).mean().values
+                )
+
     return df
 
 
@@ -416,34 +552,68 @@ def _vs_opponent_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _games_since_last_goal_block(prev_scored: np.ndarray) -> np.ndarray:
+    """Consecutive games without a goal before each row (capped at 50)."""
+    n = len(prev_scored)
+    out = np.zeros(n, dtype=np.float64)
+    run = 0.0
+    for i in range(n):
+        out[i] = min(run, 50.0)
+        v = prev_scored[i]
+        if np.isnan(v):
+            run = min(run + 1.0, 50.0)
+        elif v >= 1:
+            run = 0.0
+        else:
+            run = min(run + 1.0, 50.0)
+    return out
+
+
 def _streak_features(df: pd.DataFrame) -> pd.DataFrame:
     """Momentum/streak indicators."""
     df = df.sort_values(["player_id", "game_date", "game_id"]).copy()
-    grp = df.groupby("player_id")
 
-    shifted_scored = grp["scored"].shift(1)
+    shifted_scored = df.groupby("player_id")["scored"].shift(1)
     df["scored_last_1"] = shifted_scored.fillna(0).values
-    df["scored_last_3_sum"] = shifted_scored.rolling(3, min_periods=1).sum().values
-
-    shifted_goals = grp["goals"].shift(1)
-    df["goals_last_3_sum"] = shifted_goals.rolling(3, min_periods=1).sum().values
-    df["goals_last_1"] = shifted_goals.fillna(0).values
-
-    shifted_shots = grp["shots"].shift(1)
-    df["shots_trend_5g"] = (
-        shifted_shots.rolling(5, min_periods=2).apply(
-            lambda x: np.polyfit(range(len(x)), x, 1)[0] if len(x) >= 2 else 0.0,
-            raw=True,
-        ).values
+    df["scored_last_3_sum"] = df.groupby("player_id")["scored"].transform(
+        lambda x: x.shift(1).rolling(3, min_periods=1).sum()
     )
 
+    shifted_goals = df.groupby("player_id")["goals"].shift(1)
+    df["goals_last_3_sum"] = df.groupby("player_id")["goals"].transform(
+        lambda x: x.shift(1).rolling(3, min_periods=1).sum()
+    )
+    df["goals_last_1"] = shifted_goals.fillna(0).values
+
+    shifted_shots = df.groupby("player_id")["shots"].shift(1)
+    df["shots_trend_5g"] = df.groupby("player_id")["shots"].transform(
+        lambda x: x.shift(1).rolling(5, min_periods=2).apply(
+            lambda y: np.polyfit(range(len(y)), y, 1)[0] if len(y) >= 2 else 0.0,
+            raw=True,
+        )
+    )
+
+    df["_prev_sc_align"] = df.groupby("player_id")["scored"].shift(1)
+    df["games_since_last_goal"] = (
+        df.groupby("player_id", group_keys=False)["_prev_sc_align"]
+        .transform(lambda s: _games_since_last_goal_block(s.to_numpy(dtype=float)))
+    )
+    df.drop(columns=["_prev_sc_align"], inplace=True)
+
     if "pp_toi_seconds" in df.columns:
-        shifted_pp = grp["pp_toi_seconds"].shift(1)
-        df["pp_toi_trend_5g"] = (
-            shifted_pp.rolling(5, min_periods=2).apply(
-                lambda x: np.polyfit(range(len(x)), x, 1)[0] if len(x) >= 2 else 0.0,
+        df["pp_toi_trend_5g"] = df.groupby("player_id")["pp_toi_seconds"].transform(
+            lambda x: x.shift(1).rolling(5, min_periods=2).apply(
+                lambda y: np.polyfit(range(len(y)), y, 1)[0] if len(y) >= 2 else 0.0,
                 raw=True,
-            ).values
+            )
+        )
+
+    if "oz_start_pct" in df.columns:
+        df["oz_start_pct_trend_5g"] = df.groupby("player_id")["oz_start_pct"].transform(
+            lambda x: x.shift(1).rolling(5, min_periods=2).apply(
+                lambda y: np.polyfit(range(len(y)), y, 1)[0] if len(y) >= 2 else 0.0,
+                raw=True,
+            )
         )
 
     return df
@@ -517,6 +687,23 @@ def _interaction_features(df: pd.DataFrame) -> pd.DataFrame:
     if "shots_per_60_10g" in df.columns and "vs_opp_goals_per_game" in df.columns:
         df["shot_rate_x_vs_opp"] = (
             df["shots_per_60_10g"].fillna(0) * df["vs_opp_goals_per_game"].fillna(0)
+        )
+
+    if "shots_per_60_10g" in df.columns and "opponent_rest_days" in df.columns:
+        df["sh60_x_opp_fatigue"] = (
+            df["shots_per_60_10g"].fillna(0)
+            * (7.0 - df["opponent_rest_days"].fillna(7).clip(0, 7))
+        )
+
+    if "is_home" in df.columns and "opponent_is_back_to_back" in df.columns:
+        df["home_x_opp_b2b"] = (
+            df["is_home"].astype(float)
+            * df["opponent_is_back_to_back"].astype(float)
+        )
+
+    if "vs_opp_goals_per_game" in df.columns and "is_home" in df.columns:
+        df["vs_opp_goals_x_home"] = (
+            df["vs_opp_goals_per_game"].fillna(0) * df["is_home"].astype(float)
         )
 
     return df
@@ -632,6 +819,12 @@ def _run_full_feature_pipeline(
     logger.info("Computing team features...")
     df = _team_rolling_features(df, tables, windows)
 
+    logger.info("Computing PP share-of-team deployment features...")
+    df = _pp_share_of_team_features(df, windows)
+
+    logger.info("Computing teammate offensive context...")
+    df = _teammate_strength_features(df)
+
     logger.info("Computing opponent features...")
     df = _opponent_rolling_features(df, tables, windows)
 
@@ -640,6 +833,9 @@ def _run_full_feature_pipeline(
 
     logger.info("Computing game context features...")
     df = _game_context_features(df)
+
+    logger.info("Computing opponent schedule context...")
+    df = _opponent_schedule_context(df, tables)
 
     logger.info("Computing player profile features...")
     df = _player_profile_features(df, tables)

@@ -1,6 +1,6 @@
 """Inference module: generate predictions for upcoming games."""
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -11,7 +11,7 @@ import xgboost as xgb
 from database.db_client import get_session
 from database.ingestion import upsert_model_output
 from models.feature_engineering import build_feature_matrix
-from models.training import NON_FEATURE_COLS, load_model
+from models.training import load_model
 from utils.logger import get_logger
 
 logger = get_logger("models.inference")
@@ -75,10 +75,22 @@ def predict_upcoming(model_name: str = "lightgbm") -> pd.DataFrame:
         return pd.DataFrame()
 
     today = date.today()
+    tomorrow = today + timedelta(days=1)
     logger.info("Total rows: %d, date range: %s to %s",
                 len(df), df["game_date"].min(), df["game_date"].max())
 
-    predictions = predict_with_model(model_name, df)
+    gd = pd.to_datetime(df["game_date"]).dt.normalize()
+    horizon_mask = (gd.dt.date >= today) & (gd.dt.date <= tomorrow)
+    df_horizon = df[horizon_mask].copy()
+    if df_horizon.empty:
+        logger.warning(
+            "No rows for today/tomorrow in season %s; nothing to predict.",
+            test_season,
+        )
+        return pd.DataFrame()
+
+    logger.info("Predicting for %d rows (today + next day only)", len(df_horizon))
+    predictions = predict_with_model(model_name, df_horizon)
     return predictions
 
 

@@ -205,17 +205,18 @@ def _build_player_id_lookup() -> dict:
 
 
 def run_predictions():
-    """Generate predictions for upcoming games using historical features."""
+    """Generate predictions for today/tomorrow using enriched features + saved models."""
     from models.inference import predict_upcoming, store_predictions
 
-    logger.info("Generating predictions for upcoming games...")
+    logger.info("Generating predictions for today + tomorrow (all models)...")
     try:
-        preds = predict_upcoming()
-        if not preds.empty:
-            store_predictions(preds)
-            logger.info("Stored %d predictions", len(preds))
-        else:
-            logger.info("No predictions generated.")
+        for model_name in ("logistic_regression", "lightgbm", "xgboost"):
+            preds = predict_upcoming(model_name=model_name)
+            if not preds.empty:
+                store_predictions(preds)
+                logger.info("Stored %d rows for %s", len(preds), model_name)
+            else:
+                logger.info("No rows for %s", model_name)
     except Exception as e:
         logger.error("Prediction failed: %s", e)
 

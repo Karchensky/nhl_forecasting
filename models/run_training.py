@@ -64,8 +64,7 @@ def main():
         eval_results.append(ev)
 
     logger.info("\n=== Model Comparison ===")
-    comparison = compare_models(eval_results)
-    print("\n" + comparison.to_string(index=False))
+    compare_models(eval_results)
 
     logger.info("\n=== Feature Importance (LightGBM) ===")
     lgb_model = results["lgb"]["model"]

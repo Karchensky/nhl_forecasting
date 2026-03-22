@@ -11,7 +11,10 @@ try:
 
     _env_path = PROJECT_ROOT / ".env"
     if _env_path.exists():
-        load_dotenv(_env_path, encoding="utf-8-sig")
+        try:
+            load_dotenv(_env_path, encoding="utf-8-sig")
+        except Exception:
+            pass
 except ImportError:
     pass
 
