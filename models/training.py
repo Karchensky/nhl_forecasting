@@ -5,7 +5,24 @@ and Optuna hyperparameter tuning.
 """
 
 import pickle
+import warnings
 from pathlib import Path
+
+# sklearn 1.8 deprecates the 'penalty' kwarg on LogisticRegression; the
+# replacement API (l1_ratio-only) requires the much slower 'saga' solver.
+# Stick with liblinear + penalty='l1' until sklearn 1.10 removes it.
+warnings.filterwarnings(
+    "ignore",
+    message=".*'penalty' was deprecated.*",
+    category=FutureWarning,
+    module=r"sklearn\.linear_model",
+)
+warnings.filterwarnings(
+    "ignore",
+    message=".*Inconsistent values.*",
+    category=UserWarning,
+    module=r"sklearn\.linear_model",
+)
 
 import numpy as np
 import pandas as pd
@@ -200,7 +217,14 @@ def prepare_splits(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.Dat
 
 def train_logistic_baseline(train: pd.DataFrame, val: pd.DataFrame,
                             feature_cols: list[str]) -> dict:
-    """Train a logistic regression baseline model with time weights."""
+    """Train a logistic regression baseline model with time weights.
+
+    Platt calibration is fit via 5-fold cross-validation on the training set
+    (out-of-fold logit scores), so the validation set stays fully held-out for
+    honest metric reporting.
+    """
+    from sklearn.model_selection import KFold
+
     logger.info("Training Logistic Regression baseline...")
 
     X_train = train[feature_cols].fillna(0).values
@@ -214,27 +238,47 @@ def train_logistic_baseline(train: pd.DataFrame, val: pd.DataFrame,
     X_train_s = scaler.fit_transform(X_train)
     X_val_s = scaler.transform(X_val)
 
-    model = LogisticRegression(
-        C=1.0, max_iter=1000, solver="lbfgs", random_state=42
+    # L1 regularisation (lasso) auto-selects features, zeroing out the many
+    # correlated rolling-window columns that cause unstable coefficients with
+    # L2 alone.  Prevents extreme logits on OOD current-season inputs.
+    LR_C = 0.5
+    LR_KWARGS = dict(
+        C=LR_C, penalty="l1", solver="liblinear", max_iter=1000, random_state=42,
     )
+    model = LogisticRegression(**LR_KWARGS)
     model.fit(X_train_s, y_train, sample_weight=weights)
+
+    n_active = int((model.coef_[0] != 0).sum())
+    logger.info("LR: %d / %d features have non-zero coefficients", n_active, len(feature_cols))
 
     raw_train_probs = model.predict_proba(X_train_s)[:, 1]
     raw_val_probs = model.predict_proba(X_val_s)[:, 1]
-    # Platt scaling must use decision_function (logit margin), not predict_proba.
-    # Fitting a second logistic on [0,1] probabilities double-squashes; OOD rows then
-    # pile up at 0/1 and calibrate to identical ~99% / ~5% blobs in Streamlit.
-    raw_train_scores = model.decision_function(X_train_s)
-    raw_val_scores = model.decision_function(X_val_s)
+
+    # -- Cross-validated Platt scaling on out-of-fold logit scores --
+    # This avoids fitting the calibrator on the same data it is evaluated on.
+    oof_scores = np.full(len(y_train), np.nan)
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    for fold_train_idx, fold_cal_idx in kf.split(X_train_s):
+        fold_model = LogisticRegression(**LR_KWARGS)
+        fold_w = weights[fold_train_idx] if weights is not None else None
+        fold_model.fit(X_train_s[fold_train_idx], y_train[fold_train_idx],
+                       sample_weight=fold_w)
+        oof_scores[fold_cal_idx] = fold_model.decision_function(
+            X_train_s[fold_cal_idx]
+        )
 
     platt = LogisticRegression(C=1e9, max_iter=2000, random_state=42, solver="lbfgs")
-    platt.fit(raw_val_scores.reshape(-1, 1), y_val)
+    platt.fit(oof_scores.reshape(-1, 1), y_train)
+
+    # Apply calibrator using the final model's logits (not fold models).
+    raw_train_scores = model.decision_function(X_train_s)
+    raw_val_scores = model.decision_function(X_val_s)
     train_probs = platt.predict_proba(raw_train_scores.reshape(-1, 1))[:, 1]
     val_probs = platt.predict_proba(raw_val_scores.reshape(-1, 1))[:, 1]
 
     logger.info(
-        "LR raw train/val logloss: %.4f / %.4f | Platt(val, on logits) cal val logloss: %.4f, "
-        "AUC: %.4f | mean_pred_calibrated_val: %.4f (base_rate %.4f)",
+        "LR raw train/val logloss: %.4f / %.4f | Platt(CV-OOF) cal val logloss: %.4f, "
+        "AUC: %.4f | mean_pred_cal_val: %.4f (base_rate %.4f)",
         log_loss(y_train, raw_train_probs),
         log_loss(y_val, raw_val_probs),
         log_loss(y_val, val_probs),
@@ -316,14 +360,20 @@ def train_lightgbm(
     logger.info("LGB raw train logloss: %.4f, val logloss: %.4f",
                 log_loss(y_train, raw_train_probs), log_loss(y_val, raw_val_probs))
 
+    # Fit isotonic calibration on VALIDATION data (held-out from training).
+    # Fitting on training data lets isotonic memorize the train mapping, producing
+    # extreme 0/1 clipped probabilities when val/test scores fall outside the
+    # training range.
     iso = IsotonicRegression(out_of_bounds="clip")
-    iso.fit(raw_train_probs, y_train)
+    iso.fit(raw_val_probs, y_val)
 
     cal_train_probs = iso.predict(raw_train_probs)
     cal_val_probs = iso.predict(raw_val_probs)
 
-    logger.info("LGB calibrated val logloss: %.4f, AUC: %.4f",
-                log_loss(y_val, cal_val_probs), roc_auc_score(y_val, cal_val_probs))
+    logger.info("LGB calibrated val logloss: %.4f, AUC: %.4f, "
+                "mean_pred_cal_val: %.4f (base_rate %.4f)",
+                log_loss(y_val, cal_val_probs), roc_auc_score(y_val, cal_val_probs),
+                float(cal_val_probs.mean()), float(y_val.mean()))
 
     result = {
         "name": "lightgbm",
@@ -387,14 +437,17 @@ def train_xgboost(
     raw_train_probs = model.predict(dtrain)
     raw_val_probs = model.predict(dval)
 
+    # Fit isotonic calibration on VALIDATION data (see LGB comment above).
     iso = IsotonicRegression(out_of_bounds="clip")
-    iso.fit(raw_train_probs, y_train)
+    iso.fit(raw_val_probs, y_val)
 
     cal_train_probs = iso.predict(raw_train_probs)
     cal_val_probs = iso.predict(raw_val_probs)
 
-    logger.info("XGB calibrated val logloss: %.4f, AUC: %.4f",
-                log_loss(y_val, cal_val_probs), roc_auc_score(y_val, cal_val_probs))
+    logger.info("XGB calibrated val logloss: %.4f, AUC: %.4f, "
+                "mean_pred_cal_val: %.4f (base_rate %.4f)",
+                log_loss(y_val, cal_val_probs), roc_auc_score(y_val, cal_val_probs),
+                float(cal_val_probs.mean()), float(y_val.mean()))
 
     result = {
         "name": "xgboost",

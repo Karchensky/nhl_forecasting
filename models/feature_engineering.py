@@ -389,6 +389,28 @@ def _goalie_features(df: pd.DataFrame, tables: dict, windows: list[int]) -> pd.D
     return df
 
 
+def _vectorized_games_last_7d(sched: pd.DataFrame, team_col: str = "team_id") -> pd.Series:
+    """Count games played by each team in the 7 days BEFORE each row's game_date.
+
+    Uses a vectorized rolling-window approach: for each team, sort by date, then
+    count how many prior games fall within the 7-day window using a merge_asof-style
+    cumcount technique.  O(n log n) instead of O(n^2).
+    """
+    sched = sched.sort_values([team_col, "game_date"]).reset_index(drop=True)
+    counts = np.zeros(len(sched), dtype=int)
+    for tid, grp in sched.groupby(team_col):
+        dates = grp["game_date"].values  # sorted numpy datetime64
+        idxs = grp.index.values
+        j = 0
+        for i in range(len(dates)):
+            cutoff = dates[i] - np.timedelta64(7, "D")
+            while j < i and dates[j] < cutoff:
+                j += 1
+            # games in [cutoff, dates[i]) -- exclude current game
+            counts[idxs[i]] = i - j
+    return pd.Series(counts, index=sched.index)
+
+
 def _game_context_features(df: pd.DataFrame) -> pd.DataFrame:
     """Rest days, back-to-back, schedule density."""
     df = df.sort_values(["player_id", "game_date"]).copy()
@@ -397,19 +419,9 @@ def _game_context_features(df: pd.DataFrame) -> pd.DataFrame:
     df["rest_days"] = (df["game_date"] - df["prev_game_date"]).dt.days.fillna(7).clip(0, 30)
     df["is_back_to_back"] = (df["rest_days"] <= 1).astype(int)
 
-    # Vectorized games-in-last-7-days using team schedule
     team_dates = df[["team_id", "game_date"]].drop_duplicates()
-    team_dates = team_dates.sort_values(["team_id", "game_date"])
-
-    counts = []
-    for _, row in team_dates.iterrows():
-        mask = (
-            (team_dates["team_id"] == row["team_id"])
-            & (team_dates["game_date"] >= row["game_date"] - timedelta(days=7))
-            & (team_dates["game_date"] < row["game_date"])
-        )
-        counts.append(mask.sum())
-    team_dates["games_last_7d"] = counts
+    team_dates = team_dates.sort_values(["team_id", "game_date"]).reset_index(drop=True)
+    team_dates["games_last_7d"] = _vectorized_games_last_7d(team_dates)
 
     df = df.merge(team_dates, on=["team_id", "game_date"], how="left",
                   suffixes=("", "_dup"))
@@ -440,25 +452,15 @@ def _opponent_schedule_context(df: pd.DataFrame, tables: dict) -> pd.DataFrame:
     sched = pd.concat([h, aw], ignore_index=True).drop_duplicates(
         subset=["team_id", "game_date"]
     )
-    sched = sched.sort_values(["team_id", "game_date"])
+    sched = sched.sort_values(["team_id", "game_date"]).reset_index(drop=True)
     sched["prev_dt"] = sched.groupby("team_id")["game_date"].shift(1)
     sched["opponent_rest_days"] = (
         (sched["game_date"] - sched["prev_dt"]).dt.days.fillna(7).clip(0, 30)
     )
     sched["opponent_is_back_to_back"] = (sched["opponent_rest_days"] <= 1).astype(int)
+    sched["opponent_games_last_7d"] = _vectorized_games_last_7d(sched)
 
-    opp_dates = sched.sort_values(["team_id", "game_date"])
-    counts = []
-    for _, row in opp_dates.iterrows():
-        mask = (
-            (opp_dates["team_id"] == row["team_id"])
-            & (opp_dates["game_date"] >= row["game_date"] - timedelta(days=7))
-            & (opp_dates["game_date"] < row["game_date"])
-        )
-        counts.append(int(mask.sum()))
-    opp_dates["opponent_games_last_7d"] = counts
-
-    opp_sched = opp_dates.rename(columns={"team_id": "opponent_team_id"})
+    opp_sched = sched.rename(columns={"team_id": "opponent_team_id"})
     merge_cols = [
         "opponent_team_id", "game_date", "opponent_rest_days",
         "opponent_is_back_to_back", "opponent_games_last_7d",

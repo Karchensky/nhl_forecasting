@@ -56,6 +56,12 @@ def predict_with_model(model_name: str, df: pd.DataFrame) -> pd.DataFrame:
     else:
         raise ValueError(f"Unknown model: {model_name}")
 
+    # Safety clip for LR: even with L1 feature selection, OOD inputs can
+    # still produce extreme logits.  No NHL skater realistically has a
+    # per-game goal probability below ~2% or above ~45%.
+    if model_name == "logistic_regression":
+        probs = np.clip(probs, 0.02, 0.45)
+
     result = df[["player_id", "game_id", "team_id", "game_date", "season",
                   "is_home", "opponent_team_id"]].copy()
     result["predicted_probability"] = probs
