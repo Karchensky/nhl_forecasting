@@ -27,9 +27,21 @@ def predict_with_model(model_name: str, df: pd.DataFrame) -> pd.DataFrame:
         scaler = saved["scaler"]
         model = saved["model"]
         X_scaled = scaler.transform(X.values)
-        raw_probs = model.predict_proba(X_scaled)[:, 1]
         calibrator = saved.get("calibrator")
-        probs = calibrator.predict(raw_probs) if calibrator is not None else raw_probs
+        kind = saved.get("calibrator_kind", "isotonic")
+        if calibrator is not None:
+            if kind == "platt_logit":
+                raw_scores = model.decision_function(X_scaled)
+                probs = calibrator.predict_proba(raw_scores.reshape(-1, 1))[:, 1]
+            elif kind == "platt":
+                # Legacy bug: calibrator fit on predict_proba — keep path for old pickles
+                raw_probs = model.predict_proba(X_scaled)[:, 1]
+                probs = calibrator.predict_proba(raw_probs.reshape(-1, 1))[:, 1]
+            else:
+                raw_probs = model.predict_proba(X_scaled)[:, 1]
+                probs = calibrator.predict(raw_probs)
+        else:
+            probs = model.predict_proba(X_scaled)[:, 1]
     elif model_name == "lightgbm":
         model = saved["model"]
         raw_probs = model.predict(X)

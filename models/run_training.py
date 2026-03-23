@@ -25,7 +25,11 @@ def main():
     logger.info("=== Building Feature Matrix ===")
     df = build_feature_matrix()
     feature_cols = get_feature_columns(df)
-    logger.info("Features (%d): %s", len(feature_cols), feature_cols[:10])
+    logger.info(
+        "Features (%d), first 10: %s",
+        len(feature_cols),
+        feature_cols[:10],
+    )
 
     logger.info("\n=== Preparing Train/Val/Test Splits ===")
     train, val, test = prepare_splits(df)

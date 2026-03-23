@@ -2,8 +2,6 @@
 
 Proprietary models estimate the probability that a skater scores in a given game. Outputs are stored in SQLite and compared to **FanDuel** anytime-goal markets (via [The Odds API](https://the-odds-api.com/)) to surface positive expected value (`model P − implied P`).
 
-The `reference/` folder is not part of the active pipeline; this README describes the code under the repo root only.
-
 ---
 
 ## Quick start
@@ -38,6 +36,11 @@ High-level order of operations:
 | 7 | Train models | `python models/run_training.py` (see [Retraining models](#retraining-models)) |
 | 8 | Daily automation | `python scheduler/daily_job.py` or schedule it (boxscores, Stats API patch for completed games, odds, **today-only** predictions) |
 
+**Preseason vs regular/playoffs**
+
+- **Schedule ingest** (`parse_schedule`) only stores **regular season (2)** and **playoffs (3)**; **preseason (1)** is skipped at parse time.
+- **Feature matrix** (`_build_player_game_base` and related joins) also filters to **`game_type` ∈ {2, 3}**, so any preseason rows that reached the DB (e.g. old backfills) are **not** used for training or validation.
+
 **Data sources**
 
 - **Web API** (`api-web.nhle.com`): schedules, boxscores, rosters — primary game/skater facts.
@@ -55,7 +58,7 @@ python models/run_training.py
 
 - **Default:** builds the full causal feature matrix (~200+ features: rolling windows, season-to-date, home/road, vs-opponent, deployment, Corsi/PDO, enhanced opponent metrics, interactions, teammate context, PP share of team PP time), then:
   - **Optuna** tunes LightGBM hyperparameters (rolling time-based CV; can take **hours**).
-  - Trains **logistic regression** (weighted + scaled + **isotonic calibration**), **LightGBM**, **XGBoost** with **time-decay sample weights** and **isotonic calibration** on tree models.
+  - Trains **logistic regression** (weighted + scaled + **Platt calibration on validation logits** `decision_function` — not on `predict_proba`), **LightGBM**, **XGBoost** with **time-decay sample weights** and **isotonic calibration** on tree models.
   - Writes `models/saved/logistic_regression.pkl`, `lightgbm.pkl`, `xgboost.pkl`.
 
 **Faster iteration (skip tuning):**
@@ -102,13 +105,15 @@ In `config/settings.yaml`, `model` defines:
 
 ## Validation performance (reference — re-run training to refresh)
 
-Metrics below are on **`validation_season`** (e.g. **20242025**). Refresh after each retrain by copying the `run_training.py` summary.
+Metrics below are on **`validation_season`** (**20242025** in current config): **50,321** player-game rows. Training rows **185,437**; test season holdout **40,067** rows (not scored in this table). The full feature matrix built in that run was **275,825** rows × **309** features. Refresh after each retrain from the `run_training.py` “Model comparison” block.
 
-| Model | Log loss ↓ | Brier ↓ | ROC-AUC ↑ | Notes |
-|-------|------------|---------|-----------|--------|
-| Logistic regression | *paste* | *paste* | *paste* | **Isotonic fit on validation** raw scores (better mean calibration vs. trees); retrain and copy metrics from `run_training.py`. |
-| LightGBM | 0.3898 | 0.1192 | 0.7072 | Example `--no-tune` run; **isotonic** fit on **train** raw scores. |
-| XGBoost | 0.3895 | 0.1186 | 0.7080 | **Isotonic** on train raw scores. |
+**Example:** `python models/run_training.py --no-tune` (2026-03-22 evening), **309** features, LightGBM best iteration **~43** (early stopping), XGBoost **~159** rounds.
+
+| Model | Log loss ↓ | Brier ↓ | ROC-AUC ↑ | Mean pred (val) | Notes |
+|-------|------------|---------|-----------|-----------------|--------|
+| Logistic regression | 0.3891 | 0.1188 | 0.7036 | 0.1497 | **Platt** fit on val **logits**; val base rate **~0.1496**. |
+| LightGBM | 0.3922 | 0.1191 | 0.7071 | 0.1423 | **Isotonic** on **train** raw scores. |
+| XGBoost | 0.3903 | 0.1187 | 0.7079 | 0.1381 | **Isotonic** on train raw scores. |
 
 For stricter segmentation / hyperparameters, run **`python models/run_training.py`** (with Optuna) overnight, then update this table from the script output.
 
@@ -121,6 +126,7 @@ See also [Train / validation / test seasons](#train--validation--test-seasons-co
 | Path | Role |
 |------|------|
 | `config/settings.yaml` | NHL API, Stats API URL, Odds API, DB path, seasons, team list, model split seasons, rolling windows. |
+| `config/odds_team_map.yaml` | NHL abbrev → display names for Odds API matching + optional label aliases (Utah, Montréal, etc.). |
 | `database/` | SQLAlchemy models, `db_client`, `ingestion`, `migrate_add_stats_columns.py` |
 | `scrapers/nhl_api/` | Schedule/boxscore fetch + parsers; roster helpers; backfill utilities. |
 | `scrapers/nhl_stats_api/` | Stats API client, parsers, season/team backfill, game-level enrichment. |
@@ -128,13 +134,13 @@ See also [Train / validation / test seasons](#train--validation--test-seasons-co
 | `models/feature_engineering.py` | Causal features per (player, game): Web + Stats API fields, rolling 5/10/20g, home/road, vs-opponent, streaks, teammate/PP-share deployment, opponent 5v5/PK, interactions. |
 | `models/training.py` | Weighted training, rolling CV for Optuna, saves `models/saved/*.pkl`. |
 | `models/run_training.py` | End-to-end train + validation metrics + LightGBM gain importances. |
-| `models/inference.py` | Load pickle, score features; `predict_upcoming` = **today’s games only**. |
+| `models/inference.py` | Load pickle, score features; `predict_upcoming` = **today’s games only**. LR calibration is **Platt on logits** (`decision_function`), not on `predict_proba` (avoids OOD probability pile-up). |
 | `models/generate_predictions.py` | Score **all** rows in full matrix (optional full-history refresh). |
 | `models/evaluation.py` | Log loss, Brier, ROC-AUC, calibration / lift. |
 | `models/feature_importance_report.py` | Full feature table (or `--top N`) → stdout, `--out` markdown, `--csv`. |
 | `docs/database-erd.md` | Mermaid ERD for SQLite schema (teams, games, stats, odds, model_outputs). |
 | `scheduler/daily_job.py` | Recent + upcoming games, boxscores, Stats API enrich on completed games, odds, predictions for all three models (**today only**). |
-| `streamlit/app.py` | Predictions, value bets, diagnostics. |
+| `streamlit/app.py` | **Opportunities** tab (date / game / team / model filters; model %, market %, edges, lines, ranks) and **Diagnostics**. |
 | `utils/config.py` | YAML + `settings_local` + `.env` (`ODDS_API_KEY`). |
 | `utils/logger.py` | Shared logging. |
 
@@ -147,7 +153,7 @@ See also [Train / validation / test seasons](#train--validation--test-seasons-co
 1. `init_db()`
 2. **`update_recent_games`** — Last N days + short lookahead; finals get boxscores.
 3. **`enrich_games_with_stats_api`** — Stats API reports for those completed games.
-4. **`fetch_odds`** — FanDuel anytime goal props when `ODDS_API_KEY` is set (throttled).
+4. **`fetch_odds`** — FanDuel anytime goal props when `ODDS_API_KEY` is set (throttled). Only **today’s** `games.game_date` rows are matched; extra Odds API slates are ignored. Team strings use `config/odds_team_map.yaml` because `teams.full_name` is often a 3-letter abbrev from roster ingest. **No odds upsert** when `games.game_state` is **LIVE**, **CRIT**, **OFF**, or **FINAL** (keeps pregame lines; avoids overwriting with live prices).
 5. **`run_predictions`** — `build_feature_matrix_with_upcoming` for the configured **test season**, then scores **only calendar today** for LR, LightGBM, XGBoost → `model_outputs`.
 
 Run manually: `python scheduler/daily_job.py`
@@ -156,38 +162,13 @@ Run manually: `python scheduler/daily_job.py`
 
 ## Database schema (ERD)
 
-See **[docs/database-erd.md](docs/database-erd.md)** for a Mermaid entity-relationship diagram (render on GitHub/GitLab or with a Mermaid-capable Markdown preview).
-
----
-
-## Odds API troubleshooting
-
-If `odds` stays empty but the key works:
-
-1. **Team strings** — The Odds API `home_team` / `away_team` must match your DB. The pipeline now tries **full names**, **abbreviations** (e.g. `TOR @ MTL`), and **accent-normalized** keys (`Montréal` → `Montreal`). If you still see `Events with no DB game match`, compare logged strings to `teams.full_name` / `teams.abbreviation`.
-2. **Player strings** — Matching uses normalized names + **fuzzy** match (`difflib`, cutoff ~0.91). Large mismatches (e.g. nickname-only on the board) may still fail; align `players.full_name` with the book’s label when needed.
-3. **Empty event payload** — Some events return no `bookmakers` for `player_goal_scorer_anytime` (market not offered); the job logs `Empty odds payload for event …`.
-
----
-
-## Rolling windows & new season (e.g. 2026–27)
-
-**How `_5g` / `_20g` work**
-
-- Player rows are sorted by **`player_id`, `game_date`**. Rolling stats use `shift(1)` then `rolling(window, min_periods=1)`.
-- So **`_20g` means “up to the last 20 prior games for this player”** in the database, **not** “this season only.” Early in **2026–27**, those games still include **late 2025–26** (and earlier) as long as that history is in `player_game_stats`.
-- **`min_periods=1`** means if a skater has only **3** prior games, `goals_avg_20g` is the mean over those **3** games (not NaN).
-
-**Config when the league year rolls over (your plan)**
-
-- Move the last completed season into **`train_seasons`**, use the most recent full season as **`validation_season`**, set **`test_season`** to the new in-progress year (e.g. `20262027`).
-- **Retrain** after updating YAML so splits and saved models match the new season id.
+See **[docs/database-erd.md](docs/database-erd.md)** for a Mermaid entity-relationship diagram
 
 ---
 
 ## Feature importance (by model)
 
-Values are **each model’s share of its own signal**: \|coefficients\| (logistic) and **gain** (tree models), renormalized to **100% per model**. Rows are sorted by **combined** % (LR + LightGBM + XGBoost shares).
+Values are **each model’s share of its own signal**, renormalized to **100% per model**: logistic uses **\|coef\| / scaler scale** (approx. sensitivity per one unit in the *original* feature, **not** causal importance), while trees use **gain**. **Do not add LR % to tree %** — the report sorts by **Trees sum %** = LightGBM % + XGBoost % (two gain shares; max ~200). Compare LR % only to other LR %. After changing calibration, **retrain** (`run_training.py`) so Streamlit picks up the new `logistic_regression.pkl`.
 
 ```text
 # All features, markdown file + CSV
@@ -199,30 +180,31 @@ python models/feature_importance_report.py --top 30
 
 Snapshot (top features only — regenerate files above after retraining):
 
-Recent run (Stats-API-enriched features + segmentation):
+Recent run (2026-03-22, `--no-tune` + `feature_importance_report.py`, Stats-API-enriched **309** features; same train/val as table above):
 
-| Feature | Logistic regression % | LightGBM % | XGBoost % |
-|---------|----------------------:|-------------:|----------:|
-| `season_scoring_rate` | 1.6 | 19.4 | 11.2 |
-| `position_code` | 2.6 | 9.9 | 3.7 |
-| `pp_individual_sat_for_avg_20g` | 0.1 | 9.2 | 5.6 |
-| `shots_avg_20g` | 1.3 | 5.7 | 3.8 |
-| `goals_avg_20g` | 0.5 | 0.2 | 6.8 |
-| `pp_toi_share_20g` | 2.0 | 0.2 | 5.1 |
-| `pp_toi_share_of_team_5g` | 0.6 | 3.1 | 3.0 |
-| `shots_per_60_20g` | 2.7 | 0.7 | 0.5 |
-| `toi_seconds_avg_5g` | 1.9 | 1.2 | 0.7 |
-| `pp_toi_share_of_team_20g` | 0.6 | 1.3 | 1.5 |
-| `pp_toi_share_5g` | 2.1 | 0.6 | 0.6 |
-| `toi_seconds_avg_20g` | 1.0 | 1.1 | 1.0 |
-| `opp_sa_avg_20g` | 1.1 | 1.4 | 0.4 |
-| `blocked_shots_avg_20g` | 2.2 | 0.2 | 0.3 |
-| `pp_toi_seconds_avg_5g` | 0.9 | 0.7 | 1.0 |
-| `shooting_pct_20g` | 2.0 | 0.2 | 0.3 |
-| `season_goals_per_60` | 0.9 | 0.9 | 0.6 |
-| `corsi_against_avg_20g` | 1.9 | 0.2 | 0.3 |
-| `vs_opp_goals_per_game` | 1.5 | 0.3 | 0.4 |
-| `corsi_for_avg_20g` | 1.1 | 0.5 | 0.6 |
+| Feature | LR % | LightGBM % | XGBoost % | Trees sum % |
+|---------|-----:|-----------:|----------:|------------:|
+| `season_scoring_rate` | 2.12 | 23.27 | 10.23 | 33.5 |
+| `position_code` | 0.38 | 10.52 | 3.28 | 13.79 |
+| `pp_individual_sat_for_avg_20g` | 0.16 | 7.31 | 5.53 | 12.85 |
+| `shots_avg_20g` | 0.36 | 4.86 | 3.54 | 8.4 |
+| `pp_toi_share_of_team_5g` | 0.01 | 2.14 | 2.99 | 5.13 |
+| `pp_toi_share_20g` | 5.84 | 2.95 | 0.37 | 3.31 |
+| `pp_toi_share_of_team_20g` | 0.01 | 1.72 | 1.17 | 2.88 |
+| `points_avg_20g` | 0.22 | 0.44 | 2.06 | 2.5 |
+| `pp_toi_share_of_team_3g` | 0.10 | 0.58 | 1.75 | 2.33 |
+| `pp_toi_seconds_avg_5g` | 0.0 | 0.71 | 1.56 | 2.27 |
+| `shots_per_60_20g` | 0.21 | 1.53 | 0.73 | 2.26 |
+| `toi_seconds_avg_3g` | 0.0 | 1.26 | 0.86 | 2.12 |
+| `toi_seconds_avg_20g` | 0.0 | 1.21 | 0.75 | 1.96 |
+| `season_goals_per_60` | 0.23 | 0.66 | 0.97 | 1.63 |
+| `opp_sa_avg_20g` | 0.07 | 1.16 | 0.27 | 1.43 |
+| `toi_seconds_avg_5g` | 0.0 | 0.68 | 0.62 | 1.3 |
+| `pp_toi_share_of_team_10g` | 0.02 | 0.40 | 0.87 | 1.27 |
+| `pp_individual_sat_for_avg_10g` | 0.45 | 0.55 | 0.63 | 1.18 |
+| `pp_toi_share_5g` | 3.08 | 0.74 | 0.43 | 1.17 |
+| `shots_avg_10g` | 0.23 | 0.19 | 0.96 | 1.15 |
+| `toi_seconds_avg_10g` | 0.0 | 0.58 | 0.55 | 1.13 |
 
 ---
 
@@ -247,5 +229,3 @@ The feature pipeline emphasizes **repeatable opportunity** (deployment, volume, 
 - **Opponent schedule:** **opponent rest days**, **opponent back-to-back**, **opponent games in last 7 days** (fatigue / travel proxy).
 - **Calendar:** **day-of-week** (`game_dow`).
 - **Interactions:** e.g. shot rate × opponent fatigue, home × opponent B2B, vs-opponent rate × home.
-
-All features are built so only information **strictly before** the game is used (shifted rolling / expanding season stats).

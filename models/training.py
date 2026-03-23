@@ -221,17 +221,19 @@ def train_logistic_baseline(train: pd.DataFrame, val: pd.DataFrame,
 
     raw_train_probs = model.predict_proba(X_train_s)[:, 1]
     raw_val_probs = model.predict_proba(X_val_s)[:, 1]
+    # Platt scaling must use decision_function (logit margin), not predict_proba.
+    # Fitting a second logistic on [0,1] probabilities double-squashes; OOD rows then
+    # pile up at 0/1 and calibrate to identical ~99% / ~5% blobs in Streamlit.
+    raw_train_scores = model.decision_function(X_train_s)
+    raw_val_scores = model.decision_function(X_val_s)
 
-    # Trees use isotonic fit on *train*; LR stays biased low on val if we do the same.
-    # Fit isotonic on *validation* raw scores vs. labels so deployment probabilities
-    # track the held-out season's base rate better (ranking/AUC unchanged).
-    iso = IsotonicRegression(out_of_bounds="clip")
-    iso.fit(raw_val_probs, y_val)
-    train_probs = iso.predict(raw_train_probs)
-    val_probs = iso.predict(raw_val_probs)
+    platt = LogisticRegression(C=1e9, max_iter=2000, random_state=42, solver="lbfgs")
+    platt.fit(raw_val_scores.reshape(-1, 1), y_val)
+    train_probs = platt.predict_proba(raw_train_scores.reshape(-1, 1))[:, 1]
+    val_probs = platt.predict_proba(raw_val_scores.reshape(-1, 1))[:, 1]
 
     logger.info(
-        "LR raw train/val logloss: %.4f / %.4f | val-fit isotonic val logloss: %.4f, "
+        "LR raw train/val logloss: %.4f / %.4f | Platt(val, on logits) cal val logloss: %.4f, "
         "AUC: %.4f | mean_pred_calibrated_val: %.4f (base_rate %.4f)",
         log_loss(y_train, raw_train_probs),
         log_loss(y_val, raw_val_probs),
@@ -245,7 +247,8 @@ def train_logistic_baseline(train: pd.DataFrame, val: pd.DataFrame,
         "name": "logistic_regression",
         "model": model,
         "scaler": scaler,
-        "calibrator": iso,
+        "calibrator": platt,
+        "calibrator_kind": "platt_logit",
         "feature_cols": feature_cols,
         "train_probs": train_probs,
         "val_probs": val_probs,

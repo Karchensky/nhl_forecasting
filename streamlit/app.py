@@ -5,6 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -12,6 +13,7 @@ import streamlit as st
 from sqlalchemy import text as sa_text
 
 from database.db_client import get_engine, init_db
+from scrapers.external.odds_api import format_american_line, probability_to_american
 from models.evaluation import (
     calibration_table,
     compute_core_metrics,
@@ -22,6 +24,35 @@ st.set_page_config(
     page_title="NHL Goal Probability Model",
     layout="wide",
 )
+
+MODEL_DISPLAY = {
+    "logistic_regression": ("LR %", "LR edge %"),
+    "lightgbm": ("LightGBM %", "LightGBM edge %"),
+    "xgboost": ("XGBoost %", "XGBoost edge %"),
+}
+
+
+def _primary_market_rows(odds_df: pd.DataFrame) -> pd.DataFrame:
+    """One row per (player_id, game_id), same logic as pre-refactor inner merge.
+
+    Prefer **FanDuel** (matches ``settings.yaml`` bookmakers); if absent, use the
+    most recently ``retrieved_at`` row. Do **not** average implied % across books
+    (that can blur sharp vs soft lines and confuses verification against a single posted price).
+    """
+    if odds_df.empty:
+        return pd.DataFrame(
+            columns=["player_id", "game_id", "market_implied", "market_american"]
+        )
+    o = odds_df.copy()
+    o["_book"] = o["sportsbook"].astype(str).str.lower()
+    fd = o[o["_book"] == "fanduel"]
+    use = fd if not fd.empty else o
+    use = use.sort_values("retrieved_at", ascending=False)
+    pick = use.drop_duplicates(subset=["player_id", "game_id"], keep="first")
+    return pick.assign(
+        market_implied=pick["implied_probability"],
+        market_american=pick["american_odds"],
+    )[["player_id", "game_id", "market_implied", "market_american"]]
 
 
 @st.cache_data(ttl=300)
@@ -91,162 +122,231 @@ def load_historical_results():
     return pd.read_sql(query, engine)
 
 
-def predictions_view():
-    st.header("Model Predictions")
+def _series_to_iso_date(s: pd.Series) -> pd.Series:
+    """Normalize to date-only strings yyyy-mm-dd for display."""
+    dt = pd.to_datetime(s, errors="coerce")
+    return dt.dt.strftime("%Y-%m-%d")
+
+
+def opportunities_view():
+    """Predictions + market: filters, multi-model edges, ranks."""
+    st.header("Opportunities")
 
     preds = load_predictions()
+    odds = load_odds()
+
     if preds.empty:
         st.info("No predictions available yet. Run the model training pipeline first.")
         return
 
     work = preds.copy()
-    if "game_date" in work.columns:
-        work["game_date"] = pd.to_datetime(work["game_date"])
-        dates = sorted(work["game_date"].dt.date.unique(), reverse=True)
-        if dates:
-            selected_date = st.selectbox("Game Date", dates)
-            work = work[work["game_date"].dt.date == selected_date]
+    work["game_date"] = pd.to_datetime(work["game_date"], errors="coerce")
+    dates = sorted(work["game_date"].dropna().dt.date.unique().tolist(), reverse=True)
+    if not dates:
+        st.warning("No game dates in predictions.")
+        return
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        selected_date = st.selectbox(
+            "Date",
+            options=dates,
+            format_func=lambda d: d.isoformat(),
+            key="opp_date",
+        )
+    work = work[work["game_date"].dt.date == selected_date].copy()
+    if work.empty:
+        st.info("No rows for the selected date.")
+        return
+
+    games_df = (
+        work[["game_id", "away_team", "home_team"]]
+        .drop_duplicates()
+        .sort_values(["home_team", "away_team", "game_id"])
+    )
+    base_lbl = (
+        games_df["away_team"].astype(str) + " @ " + games_df["home_team"].astype(str)
+    )
+    if base_lbl.duplicated().any():
+        games_df = games_df.assign(label=base_lbl + " (" + games_df["game_id"].astype(str) + ")")
+    else:
+        games_df = games_df.assign(label=base_lbl)
+
+    game_options = ["All games"] + games_df["label"].tolist()
+    with c2:
+        game_pick = st.selectbox("Game", options=game_options, key="opp_game")
+    if game_pick != "All games":
+        gid = int(games_df.loc[games_df["label"] == game_pick, "game_id"].iloc[0])
+        work = work[work["game_id"] == gid]
+
+    teams = sorted(work["player_team"].dropna().unique().tolist())
+    with c3:
+        team_pick = st.multiselect(
+            "Player team",
+            options=teams,
+            default=teams,
+            key="opp_team",
+        )
+    if team_pick:
+        work = work[work["player_team"].isin(team_pick)]
+
+    all_models = sorted(work["model_version"].unique().tolist())
+    with c4:
+        model_pick = st.multiselect(
+            "Models",
+            options=all_models,
+            default=all_models,
+            format_func=lambda m: {
+                "logistic_regression": "Logistic regression",
+                "lightgbm": "LightGBM",
+                "xgboost": "XGBoost",
+            }.get(m, m),
+            key="opp_models",
+        )
+    if not model_pick:
+        st.info("Select at least one model.")
+        return
+
+    work = work[work["model_version"].isin(model_pick)]
 
     id_cols = [
-        "player_id", "game_id", "player_name", "player_team",
-        "home_team", "away_team", "position", "game_date",
+        "player_id",
+        "game_id",
+        "player_name",
+        "player_team",
+        "home_team",
+        "away_team",
+        "game_date",
     ]
-    index_cols = [c for c in id_cols if c in work.columns]
-    model_versions = sorted(work["model_version"].unique().tolist())
-
     wide = work.pivot_table(
-        index=index_cols,
+        index=[c for c in id_cols if c in work.columns],
         columns="model_version",
         values="predicted_probability",
         aggfunc="first",
     ).reset_index()
     wide.columns.name = None
 
-    prob_cols = [c for c in model_versions if c in wide.columns]
-    if prob_cols:
-        row_max = wide[prob_cols].max(axis=1)
+    # Market: single book row per (player, game) — FanDuel first, else latest snapshot
+    odds_f = odds.copy()
+    if not odds_f.empty:
+        odds_f["game_date"] = pd.to_datetime(odds_f["game_date"], errors="coerce")
+        odds_f = odds_f[odds_f["game_date"].dt.date == selected_date]
+        if not odds_f.empty:
+            odds_pick = _primary_market_rows(odds_f)
+            wide = wide.merge(odds_pick, on=["player_id", "game_id"], how="left")
+        else:
+            wide["market_implied"] = np.nan
+            wide["market_american"] = np.nan
     else:
-        row_max = pd.Series(0.0, index=wide.index)
-
-    min_prob = st.slider("Minimum Probability (%)", 0, 100, 10) / 100.0
-    wide = wide[row_max >= min_prob]
-
-    display = wide.copy()
-    rename_map = {}
-    for c in prob_cols:
-        short = {
-            "logistic_regression": "LR %",
-            "lightgbm": "LightGBM %",
-            "xgboost": "XGBoost %",
-        }.get(c, f"{c} %")
-        rename_map[c] = short
-        display[c] = (display[c] * 100).round(1)
-    display = display.rename(columns=rename_map)
-
-    sort_col = "LightGBM %" if "LightGBM %" in display.columns else (
-        list(rename_map.values())[0] if rename_map else None
-    )
-    if sort_col:
-        display = display.sort_values(sort_col, ascending=False)
-
-    show_cols = [c for c in display.columns if c not in ("player_id", "game_id")]
-    st.dataframe(display[show_cols], width="stretch", hide_index=True)
-
-    if not wide.empty and prob_cols:
-        fig = go.Figure()
-        for c in prob_cols:
-            fig.add_trace(go.Histogram(
-                x=wide[c].dropna(),
-                name=c.replace("_", " "),
-                opacity=0.55,
-                nbinsx=30,
-            ))
-        fig.update_layout(
-            title="Prediction distribution by model",
-            barmode="overlay",
-            xaxis_title="Predicted probability",
-            yaxis_title="Count",
-        )
-        st.plotly_chart(fig, width="stretch")
-
-
-def value_view():
-    st.header("Value Bets (+EV Opportunities)")
-
-    preds = load_predictions()
-    odds = load_odds()
-
-    if preds.empty:
-        st.info("No predictions available.")
-        return
-    if odds.empty:
         n_db = odds_table_row_count()
-        hint = ""
-        if n_db is not None and n_db > 0:
-            hint = (
-                f" The database has **{n_db}** odds row(s), but the loaded odds "
-                "dataframe is empty — check DB path vs. this app’s working directory."
+        if n_db == 0:
+            st.caption(
+                "No odds in the database — edge and market columns will be empty. "
+                "Set `ODDS_API_KEY` and run the daily job to ingest lines."
             )
-        elif n_db == 0:
-            hint = (
-                " The `odds` table is **empty**. Typical causes: (1) Odds API player "
-                "names don’t match `players.full_name` in the DB (lookup is exact "
-                "lowercase), or (2) `upsert_odds` failed before the fix — re-run "
-                "`python scheduler/daily_job.py` after pulling the latest code."
-            )
-        st.info(
-            "No odds data available. Configure your Odds API key and run "
-            "the odds scraper to see value opportunities." + hint
+        wide["market_implied"] = np.nan
+        wide["market_american"] = np.nan
+
+    def _line_from_p(p) -> str:
+        if pd.isna(p):
+            return "—"
+        try:
+            return format_american_line(probability_to_american(float(p)))
+        except Exception:
+            return "—"
+
+    edge_cols = []
+    for m in model_pick:
+        if m not in wide.columns:
+            continue
+        pct_col, edge_col = MODEL_DISPLAY.get(m, (f"{m} %", f"{m} edge %"))
+        wide[pct_col] = (wide[m] * 100).round(1)
+        wide[edge_col] = np.where(
+            wide["market_implied"].notna(),
+            ((wide[m] - wide["market_implied"]) * 100).round(2),
+            np.nan,
         )
-        return
+        edge_cols.append(edge_col)
 
-    model_versions = preds["model_version"].unique().tolist()
-    selected_model = st.selectbox("Model", model_versions,
-                                  index=model_versions.index("lightgbm")
-                                  if "lightgbm" in model_versions else 0,
-                                  key="value_model")
+    wide["Market line"] = wide["market_american"].map(
+        lambda x: format_american_line(int(x)) if pd.notna(x) else "—"
+    )
+    wide["Market %"] = np.where(
+        wide["market_implied"].notna(),
+        (wide["market_implied"] * 100).round(1),
+        np.nan,
+    )
 
-    p = preds[preds["model_version"] == selected_model].copy()
-    o = odds[["player_id", "game_id", "sportsbook", "american_odds",
-              "implied_probability"]].copy()
-    for col in ("player_id", "game_id"):
-        if col in p.columns:
-            p[col] = pd.to_numeric(p[col], errors="coerce").astype("Int64")
-        if col in o.columns:
-            o[col] = pd.to_numeric(o[col], errors="coerce").astype("Int64")
-    merged = p.merge(o, on=["player_id", "game_id"], how="inner")
+    model_prob_cols = [m for m in model_pick if m in wide.columns]
+    if model_prob_cols:
+        wide["_avg_model_p"] = wide[model_prob_cols].mean(axis=1, skipna=True)
+    else:
+        wide["_avg_model_p"] = np.nan
 
-    if merged.empty:
-        st.warning("No matching predictions + odds found.")
-        return
+    wide["Model line (avg)"] = wide["_avg_model_p"].map(_line_from_p)
 
-    merged["edge"] = merged["predicted_probability"] - merged["implied_probability"]
-    merged["edge_pct"] = (merged["edge"] * 100).round(2)
+    if edge_cols:
+        mat = wide[edge_cols].to_numpy(dtype=float)
+        wide["_best_edge"] = np.nanmax(
+            np.where(np.isfinite(mat), mat, np.nan), axis=1
+        )
+    else:
+        wide["_best_edge"] = np.nan
 
-    min_edge = st.slider("Minimum Edge (%)", -20, 30, 2, key="min_edge") / 100.0
-    value_bets = merged[merged["edge"] >= min_edge].sort_values("edge", ascending=False)
+    wide["Edge rank (overall)"] = (
+        wide["_best_edge"]
+        .rank(method="min", ascending=False)
+        .astype("Int64")
+    )
+    wide["Edge rank (team)"] = (
+        wide.groupby("player_team", dropna=False)["_best_edge"]
+        .rank(method="min", ascending=False)
+        .astype("Int64")
+    )
 
-    display = value_bets[[
-        "player_name", "player_team", "home_team", "away_team",
-        "predicted_probability", "implied_probability", "edge_pct",
-        "american_odds", "sportsbook", "game_date",
-    ]].copy()
-    display["predicted_probability"] = (display["predicted_probability"] * 100).round(1)
-    display["implied_probability"] = (display["implied_probability"] * 100).round(1)
-    display = display.rename(columns={
-        "predicted_probability": "Model %",
-        "implied_probability": "Market %",
-        "edge_pct": "Edge %",
-        "american_odds": "Odds",
-    })
+    wide = wide.sort_values("_best_edge", ascending=False, na_position="last")
 
-    n_positive = len(value_bets[value_bets["edge"] > 0])
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Total Matches", len(merged))
-    col2.metric("+EV Opportunities", n_positive)
-    col3.metric("Avg Edge", f"{value_bets['edge_pct'].mean():.1f}%" if not value_bets.empty else "N/A")
+    st.markdown(f"**Slate:** `{selected_date.isoformat()}`")
+
+    out_cols = (
+        ["Edge rank (overall)", "Edge rank (team)", "player_name", "player_team", "home_team", "away_team"]
+        + [MODEL_DISPLAY[m][0] for m in model_pick if m in wide.columns]
+        + ["Market line", "Market %"]
+        + [MODEL_DISPLAY[m][1] for m in model_pick if m in wide.columns]
+        + ["Model line (avg)"]
+    )
+    out_cols = [c for c in out_cols if c in wide.columns]
+    display = wide[out_cols].copy()
+    display = display.rename(
+        columns={
+            "player_name": "Player",
+            "player_team": "Team",
+            "home_team": "Home",
+            "away_team": "Away",
+        }
+    )
 
     st.dataframe(display, width="stretch", hide_index=True)
+
+    with st.expander("Prediction distributions (selected filters)"):
+        if model_prob_cols:
+            fig = go.Figure()
+            for m in model_prob_cols:
+                fig.add_trace(
+                    go.Histogram(
+                        x=wide[m].dropna(),
+                        name=m.replace("_", " "),
+                        opacity=0.55,
+                        nbinsx=30,
+                    )
+                )
+            fig.update_layout(
+                title="Predicted probability by model",
+                barmode="overlay",
+                xaxis_title="Probability",
+                yaxis_title="Count",
+            )
+            st.plotly_chart(fig, width="stretch")
 
 
 def diagnostics_view():
@@ -258,6 +358,10 @@ def diagnostics_view():
     if results.empty:
         st.info("No historical data available for diagnostics.")
         return
+
+    if "game_date" in results.columns:
+        results = results.copy()
+        results["game_date"] = _series_to_iso_date(results["game_date"])
 
     if not preds.empty:
         model_versions = preds["model_version"].unique().tolist()
@@ -284,15 +388,23 @@ def diagnostics_view():
             st.subheader("Calibration Curve")
             cal = calibration_table(y_true, y_prob)
             fig_cal = go.Figure()
-            fig_cal.add_trace(go.Scatter(
-                x=cal["predicted_mean"], y=cal["actual_rate"],
-                mode="lines+markers", name="Model",
-            ))
-            fig_cal.add_trace(go.Scatter(
-                x=[0, 1], y=[0, 1],
-                mode="lines", name="Perfect",
-                line=dict(dash="dash", color="gray"),
-            ))
+            fig_cal.add_trace(
+                go.Scatter(
+                    x=cal["predicted_mean"],
+                    y=cal["actual_rate"],
+                    mode="lines+markers",
+                    name="Model",
+                )
+            )
+            fig_cal.add_trace(
+                go.Scatter(
+                    x=[0, 1],
+                    y=[0, 1],
+                    mode="lines",
+                    name="Perfect",
+                    line=dict(dash="dash", color="gray"),
+                )
+            )
             fig_cal.update_layout(
                 xaxis_title="Mean Predicted Probability",
                 yaxis_title="Actual Scoring Rate",
@@ -307,16 +419,24 @@ def diagnostics_view():
 
             st.subheader("Lift Chart")
             lift = lift_table(y_true, y_prob)
-            fig_lift = px.bar(lift, x="decile", y="lift",
-                              title="Lift by Decile (1 = highest predicted probability)")
+            fig_lift = px.bar(
+                lift,
+                x="decile",
+                y="lift",
+                title="Lift by Decile (1 = highest predicted probability)",
+            )
             fig_lift.add_hline(y=1.0, line_dash="dash", line_color="gray")
             fig_lift.update_xaxes(title="Decile")
             fig_lift.update_yaxes(title="Lift vs. Base Rate")
             st.plotly_chart(fig_lift, width="stretch")
 
             st.subheader("Cumulative Gains")
-            fig_gains = px.line(lift, x="decile", y="cumulative_actual",
-                                title="Cumulative Gains Chart")
+            fig_gains = px.line(
+                lift,
+                x="decile",
+                y="cumulative_actual",
+                title="Cumulative Gains Chart",
+            )
             fig_gains.update_xaxes(title="Decile")
             fig_gains.update_yaxes(title="Cumulative % of Goals Captured")
             st.plotly_chart(fig_gains, width="stretch")
@@ -332,8 +452,9 @@ def diagnostics_view():
             st.dataframe(season_counts, hide_index=True)
     with col2:
         if not results.empty:
-            results["scored"] = (results["goals"] >= 1).astype(int)
-            base_rate = results["scored"].mean()
+            results_sc = results.copy()
+            results_sc["scored"] = (results_sc["goals"] >= 1).astype(int)
+            base_rate = results_sc["scored"].mean()
             st.metric("Overall Scoring Rate", f"{base_rate * 100:.1f}%")
 
 
@@ -342,13 +463,11 @@ def main():
 
     init_db()
 
-    tab1, tab2, tab3 = st.tabs(["Predictions", "Value Bets", "Diagnostics"])
+    tab1, tab2 = st.tabs(["Opportunities", "Diagnostics"])
 
     with tab1:
-        predictions_view()
+        opportunities_view()
     with tab2:
-        value_view()
-    with tab3:
         diagnostics_view()
 
 

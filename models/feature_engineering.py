@@ -16,6 +16,18 @@ from utils.logger import get_logger
 
 logger = get_logger("models.features")
 
+# NHL Web API ``gameType``: 1 = preseason, 2 = regular season, 3 = playoffs.
+# Schedule ingest already skips type 1; this also drops any preseason rows in DB.
+COMPETITIVE_GAME_TYPES = (2, 3)
+
+
+def _games_competitive_for_joins(tables: dict) -> pd.DataFrame:
+    """``game_id`` + ``game_date`` for regular + playoff games only."""
+    g = tables["games"][["game_id", "game_date", "game_type"]].copy()
+    g = g[g["game_type"].isin(COMPETITIVE_GAME_TYPES)]
+    g["game_date"] = pd.to_datetime(g["game_date"])
+    return g[["game_id", "game_date"]]
+
 
 def _load_tables() -> dict[str, pd.DataFrame]:
     """Load core tables into DataFrames."""
@@ -34,6 +46,7 @@ def _build_player_game_base(tables: dict) -> pd.DataFrame:
     players = tables["players"].copy()
 
     games = games[games["game_state"].isin(["FINAL", "OFF"])].copy()
+    games = games[games["game_type"].isin(COMPETITIVE_GAME_TYPES)].copy()
     games["game_date"] = pd.to_datetime(games["game_date"])
 
     df = pgs.merge(games[["game_id", "game_date", "season", "home_team_id",
@@ -196,8 +209,7 @@ def _season_player_features(df: pd.DataFrame) -> pd.DataFrame:
 def _team_rolling_features(df: pd.DataFrame, tables: dict, windows: list[int]) -> pd.DataFrame:
     """Rolling team-level features (team's recent form)."""
     tgs = tables["team_game_stats"].copy()
-    games = tables["games"][["game_id", "game_date"]].copy()
-    games["game_date"] = pd.to_datetime(games["game_date"])
+    games = _games_competitive_for_joins(tables)
     tgs = tgs.merge(games, on="game_id", how="inner")
     tgs = tgs.sort_values(["team_id", "game_date"]).copy()
 
@@ -289,8 +301,7 @@ def _teammate_strength_features(df: pd.DataFrame) -> pd.DataFrame:
 def _opponent_rolling_features(df: pd.DataFrame, tables: dict, windows: list[int]) -> pd.DataFrame:
     """Rolling opponent-level features (opponent defensive strength)."""
     tgs = tables["team_game_stats"].copy()
-    games = tables["games"][["game_id", "game_date"]].copy()
-    games["game_date"] = pd.to_datetime(games["game_date"])
+    games = _games_competitive_for_joins(tables)
     tgs = tgs.merge(games, on="game_id", how="inner")
 
     # Self-join to get opponent's goals/shots in same game
@@ -332,11 +343,20 @@ def _opponent_rolling_features(df: pd.DataFrame, tables: dict, windows: list[int
 def _goalie_features(df: pd.DataFrame, tables: dict, windows: list[int]) -> pd.DataFrame:
     """Opponent starting goalie recent performance."""
     ggs = tables["goalie_game_stats"].copy()
-    games = tables["games"][["game_id", "game_date"]].copy()
-    games["game_date"] = pd.to_datetime(games["game_date"])
+    games = _games_competitive_for_joins(tables)
     ggs = ggs.merge(games, on="game_id", how="inner")
 
     starters = ggs[ggs["started"] == True].copy()
+    # Multiple rows with started=True for one team-game breaks merge (pandas crash);
+    # keep the primary starter (most TOI).
+    if "toi_seconds" not in starters.columns:
+        starters["toi_seconds"] = 0
+    starters = starters.sort_values(
+        ["team_id", "game_id", "toi_seconds"],
+        ascending=[True, True, False],
+        na_position="last",
+    )
+    starters = starters.groupby(["team_id", "game_id"], as_index=False).first()
     starters = starters.sort_values(["player_id", "game_date"]).copy()
 
     starters["save_pct_clean"] = starters["save_pct"].fillna(0.9)
@@ -354,6 +374,16 @@ def _goalie_features(df: pd.DataFrame, tables: dict, windows: list[int]) -> pd.D
     goalie_feats = starters[goalie_cols].rename(
         columns={"player_id": "opp_goalie_id", "team_id": "opponent_team_id"}
     )
+    # Must be exactly one row per (opponent_team_id, game_id) for left merge
+    dup_n = goalie_feats.duplicated(subset=["opponent_team_id", "game_id"]).sum()
+    if dup_n:
+        logger.warning("Dropping %d duplicate goalie rows per team-game", int(dup_n))
+        goalie_feats = goalie_feats.drop_duplicates(
+            subset=["opponent_team_id", "game_id"], keep="first"
+        )
+
+    for col in ("opponent_team_id", "game_id"):
+        goalie_feats[col] = pd.to_numeric(goalie_feats[col], errors="coerce").astype("int64")
 
     df = df.merge(goalie_feats, on=["opponent_team_id", "game_id"], how="left")
     return df
@@ -397,6 +427,7 @@ def _opponent_schedule_context(df: pd.DataFrame, tables: dict) -> pd.DataFrame:
     """Opponent team rest, back-to-back, and schedule density (mirror of player context)."""
     g = tables["games"].copy()
     g = g[g["game_state"].isin(["FINAL", "OFF"])].copy()
+    g = g[g["game_type"].isin(COMPETITIVE_GAME_TYPES)].copy()
     if g.empty:
         df["opponent_rest_days"] = 7.0
         df["opponent_is_back_to_back"] = 0
@@ -622,8 +653,7 @@ def _streak_features(df: pd.DataFrame) -> pd.DataFrame:
 def _enhanced_opponent_features(df: pd.DataFrame, tables: dict, windows: list[int]) -> pd.DataFrame:
     """Enhanced opponent defensive features using enrichment data."""
     tgs = tables["team_game_stats"].copy()
-    games = tables["games"][["game_id", "game_date"]].copy()
-    games["game_date"] = pd.to_datetime(games["game_date"])
+    games = _games_competitive_for_joins(tables)
     tgs = tgs.merge(games, on="game_id", how="inner")
     tgs = tgs.sort_values(["team_id", "game_date"]).copy()
 
@@ -720,6 +750,7 @@ def _build_upcoming_game_base(tables: dict) -> pd.DataFrame:
     players = tables["players"].copy()
 
     upcoming = games[~games["game_state"].isin(["FINAL", "OFF"])].copy()
+    upcoming = upcoming[upcoming["game_type"].isin(COMPETITIVE_GAME_TYPES)].copy()
     if upcoming.empty:
         return pd.DataFrame()
 
@@ -727,6 +758,7 @@ def _build_upcoming_game_base(tables: dict) -> pd.DataFrame:
 
     goalies = set(players.loc[players["position"] == "G", "player_id"])
     completed = games[games["game_state"].isin(["FINAL", "OFF"])].copy()
+    completed = completed[completed["game_type"].isin(COMPETITIVE_GAME_TYPES)].copy()
     completed["game_date"] = pd.to_datetime(completed["game_date"])
 
     rows = []

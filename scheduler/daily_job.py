@@ -18,6 +18,7 @@ from database.ingestion import (
     upsert_team_game_stats,
 )
 from database.models import PlayerGameStats, TeamGameStats
+from scrapers.nhl_api.backfill import _update_team_names_from_game
 from scrapers.nhl_api.client import NHLApiClient
 from scrapers.nhl_api.parsers import parse_boxscore, parse_schedule
 from scrapers.nhl_stats_api.client import NHLStatsApiClient
@@ -74,6 +75,8 @@ def update_recent_games(client: NHLApiClient, days_back: int = 3):
             if window_start <= gd <= window_end:
                 with get_session() as session:
                     upsert_game(session, g)
+                    # Refresh teams.full_name from schedule (roster ingest uses abbrev only).
+                    _update_team_names_from_game(session, g, data)
                 if g["game_state"] in ("FINAL", "OFF"):
                     completed_game_ids.add(g["game_id"])
 
@@ -173,14 +176,15 @@ def _get_upcoming_game_ids() -> list[int]:
 
 
 def _build_game_id_lookup() -> dict:
-    """Build mapping from many 'Away @ Home' variants -> game_id (today/tomorrow).
+    """Build mapping from many 'Away @ Home' variants -> game_id for **today only**.
 
-    Includes full names, abbreviations, and accent-normalized keys for Odds API matching.
+    Predictions and value bets are scoped to the current calendar date; Odds API may
+    return a longer slate — we only match/store games dated today in our DB.
     """
     from scrapers.external.odds_matching import build_game_id_lookup_from_rows
 
     today = date.today()
-    tomorrow = today + timedelta(days=1)
+    today_s = str(today)
     engine = get_engine()
     with engine.connect() as conn:
         rows = conn.execute(
@@ -193,23 +197,11 @@ def _build_game_id_lookup() -> dict:
                 FROM games g
                 JOIN teams at ON g.away_team_id = at.team_id
                 JOIN teams ht ON g.home_team_id = ht.team_id
-                WHERE g.game_date >= :today AND g.game_date <= :tomorrow
+                WHERE g.game_date = :today
             """),
-            {"today": str(today), "tomorrow": str(tomorrow)},
+            {"today": today_s},
         ).fetchall()
     return build_game_id_lookup_from_rows(rows)
-
-
-def _build_player_id_lookup() -> tuple[dict, list[str]]:
-    """Exact + normalized player keys, plus sorted key list for fuzzy Odds API names."""
-    from scrapers.external.odds_matching import build_player_id_lookup
-
-    engine = get_engine()
-    with engine.connect() as conn:
-        rows = conn.execute(
-            sa_text("SELECT player_id, full_name FROM players WHERE active = 1")
-        ).fetchall()
-    return build_player_id_lookup(list(rows))
 
 
 def run_predictions():
@@ -243,22 +235,22 @@ def fetch_odds():
             return
 
         game_id_lookup = _build_game_id_lookup()
-        player_id_lookup, player_lookup_keys = _build_player_id_lookup()
 
         if not game_id_lookup:
-            logger.info("No upcoming games found for odds lookup.")
+            logger.info("No games dated today in DB for odds lookup.")
             return
 
         n_slate = len({gid for gid in game_id_lookup.values()})
         logger.info(
-            "Fetching odds (%d unique games, %d lookup key variants)...",
+            "Fetching odds for today's slate (%d unique games, %d lookup key variants)...",
             n_slate,
             len(game_id_lookup),
         )
+        # Roster-scoped player resolution only (avoids global name-collision noise).
         fetch_and_store_odds(
             game_id_lookup=game_id_lookup,
-            player_id_lookup=player_id_lookup,
-            player_lookup_keys=player_lookup_keys,
+            player_id_lookup=None,
+            player_lookup_keys=None,
         )
     except Exception as e:
         logger.error("Odds fetch failed: %s", e)

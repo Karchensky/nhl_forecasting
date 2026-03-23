@@ -30,7 +30,12 @@ def feature_importance_rows(
     lgb = load_model("lightgbm")
     xgb = load_model("xgboost")
 
-    lr_imp = np.abs(lr["model"].coef_[0])
+    # LR coefficients are on StandardScaler units; |coef|/scale approximates
+    # sensitivity w.r.t. one unit in the *original* feature — still not comparable
+    # to tree gain %, but less misleading than raw |coef|.
+    scale = np.asarray(lr["scaler"].scale_, dtype=float)
+    scale = np.maximum(scale, 1e-12)
+    lr_imp = np.abs(lr["model"].coef_[0] / scale)
     lgb_imp = np.array(lgb["model"].feature_importance(importance_type="gain"))
     xgb_scores = xgb["model"].get_score(importance_type="gain")
     xgb_imp = np.array([xgb_scores.get(f, 0.0) for f in fc])
@@ -39,8 +44,9 @@ def feature_importance_rows(
     lgb_pct = _norm_pct(lgb_imp)
     xgb_pct = _norm_pct(xgb_imp)
 
-    combined = lr_pct + lgb_pct + xgb_pct
-    order = np.argsort(-combined)
+    # LR % and tree gain % are different metrics — do not add them. Sort by boosting models.
+    trees_combined = lgb_pct + xgb_pct
+    order = np.argsort(-trees_combined)
     if top_n is not None:
         order = order[:top_n]
 
@@ -51,7 +57,7 @@ def feature_importance_rows(
             "logistic_regression_pct": round(float(lr_pct[i]), 2),
             "lightgbm_pct": round(float(lgb_pct[i]), 2),
             "xgboost_pct": round(float(xgb_pct[i]), 2),
-            "combined_pct": round(float(combined[i]), 2),
+            "trees_sum_pct": round(float(trees_combined[i]), 2),
         })
     return rows
 
@@ -81,13 +87,17 @@ def main():
 
     rows = feature_importance_rows(top_n=args.top)
     lines = [
-        "| Feature | LR % | LightGBM % | XGBoost % | Combined % |",
-        "|---------|-----:|-----------:|----------:|-----------:|",
+        "<!-- LR % = share of sum(|coef|/scaler) across *all* LR features (unit sensitivity, "
+        "not causal importance). LGB/XGB % = gain share within each tree model. "
+        "Trees sum % = LGB% + XGB% (sort key only; max ~200). Do not interpret LR% like tree%. -->",
+        "",
+        "| Feature | LR % | LightGBM % | XGBoost % | Trees sum % |",
+        "|---------|-----:|-----------:|----------:|------------:|",
     ]
     for r in rows:
         lines.append(
             f"| `{r['feature']}` | {r['logistic_regression_pct']} | "
-            f"{r['lightgbm_pct']} | {r['xgboost_pct']} | {r['combined_pct']} |"
+            f"{r['lightgbm_pct']} | {r['xgboost_pct']} | {r['trees_sum_pct']} |"
         )
     text = "\n".join(lines) + "\n"
 

@@ -1,0 +1,47 @@
+# Maps NHL API abbreviations (teams.abbreviation) to display names that match
+# The Odds API / common broadcast strings. Edit `UTA` if Utah's marketing name changes.
+#
+# odds_label_aliases: normalize_team_label(key) -> exact display string used in lookup keys
+# (fixes Montreal/Montréal, Utah variants, etc.)
+
+abbrev_to_display_name:
+  ANA: Anaheim Ducks
+  BOS: Boston Bruins
+  BUF: Buffalo Sabres
+  CAR: Carolina Hurricanes
+  CBJ: Columbus Blue Jackets
+  CGY: Calgary Flames
+  CHI: Chicago Blackhawks
+  COL: Colorado Avalanche
+  DAL: Dallas Stars
+  DET: Detroit Red Wings
+  EDM: Edmonton Oilers
+  FLA: Florida Panthers
+  LAK: Los Angeles Kings
+  MIN: Minnesota Wild
+  MTL: Montreal Canadiens
+  NJD: New Jersey Devils
+  NSH: Nashville Predators
+  NYI: New York Islanders
+  NYR: New York Rangers
+  OTT: Ottawa Senators
+  PHI: Philadelphia Flyers
+  PIT: Pittsburgh Penguins
+  SEA: Seattle Kraken
+  SJS: San Jose Sharks
+  STL: St. Louis Blues
+  TBL: Tampa Bay Lightning
+  TOR: Toronto Maple Leafs
+  UTA: Utah Mammoth
+  VAN: Vancouver Canucks
+  VGK: Vegas Golden Knights
+  WPG: Winnipeg Jets
+  WSH: Washington Capitals
+
+# Optional: extra Odds API / short labels (lowercase ASCII after NFKD) -> display name above
+odds_label_aliases:
+  utah hockey club: Utah Mammoth
+  utah: Utah Mammoth
+  montréal canadiens: Montreal Canadiens
+  st louis blues: St. Louis Blues
+  st. louis blues: St. Louis Blues

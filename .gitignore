@@ -191,5 +191,3 @@ models/saved/
 *.pkl
 *.joblib
 config/settings_local.yaml
-
-reference/
