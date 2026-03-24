@@ -364,7 +364,57 @@ def opportunities_view():
         .astype("Int64")
     )
 
+    # Build game label for game rank grouping
+    wide["_game_label"] = (
+        wide["away_team"].astype(str) + " @ " + wide["home_team"].astype(str)
+    )
+    wide["Game rank"] = (
+        wide.groupby("_game_label", dropna=False)["_best_edge"]
+        .rank(method="min", ascending=False)
+        .astype("Int64")
+    )
+
     wide = wide.sort_values("_best_edge", ascending=False, na_position="last")
+
+    # -- Slicer row: edge + rank filters --
+    st.markdown("---")
+    f1, f2, f3, f4 = st.columns(4)
+    avg_edge_vals = wide["Avg edge %"].dropna()
+    edge_min = float(avg_edge_vals.min()) if not avg_edge_vals.empty else -20.0
+    edge_max = float(avg_edge_vals.max()) if not avg_edge_vals.empty else 10.0
+    with f1:
+        edge_range = st.slider(
+            "Avg edge % range",
+            min_value=edge_min, max_value=edge_max,
+            value=(edge_min, edge_max), step=0.5,
+            key="opp_edge_range",
+        )
+    with f2:
+        max_rank = int(wide["Rank"].max()) if wide["Rank"].notna().any() else 100
+        rank_limit = st.slider(
+            "Overall rank (top N)", min_value=1, max_value=max_rank,
+            value=max_rank, step=1, key="opp_rank_limit",
+        )
+    with f3:
+        max_team_rank = int(wide["Team rank"].max()) if wide["Team rank"].notna().any() else 30
+        team_rank_limit = st.slider(
+            "Team rank (top N)", min_value=1, max_value=max_team_rank,
+            value=max_team_rank, step=1, key="opp_team_rank_limit",
+        )
+    with f4:
+        max_game_rank = int(wide["Game rank"].max()) if wide["Game rank"].notna().any() else 30
+        game_rank_limit = st.slider(
+            "Game rank (top N)", min_value=1, max_value=max_game_rank,
+            value=max_game_rank, step=1, key="opp_game_rank_limit",
+        )
+
+    # Apply slicer filters
+    mask = pd.Series(True, index=wide.index)
+    mask &= wide["Avg edge %"].between(edge_range[0], edge_range[1]) | wide["Avg edge %"].isna()
+    mask &= wide["Rank"].le(rank_limit) | wide["Rank"].isna()
+    mask &= wide["Team rank"].le(team_rank_limit) | wide["Team rank"].isna()
+    mask &= wide["Game rank"].le(game_rank_limit) | wide["Game rank"].isna()
+    wide = wide[mask]
 
     # -- Summary KPIs --
     has_market = wide["market_implied"].notna()
@@ -384,10 +434,10 @@ def opportunities_view():
 
     # -- Main table --
     out_cols = (
-        ["Rank", "Team rank", "player_name", "position", "player_team",
-         "home_team", "away_team"]
+        ["Rank", "Team rank", "Game rank", "player_name", "position",
+         "player_team", "home_team", "away_team"]
         + [MODEL_DISPLAY[m][0] for m in model_pick if m in wide.columns]
-        + ["FD %", "FD Line", "Avg model line"]
+        + ["FD Line", "Avg model line", "FD %"]
         + [MODEL_DISPLAY[m][1] for m in model_pick if m in wide.columns]
         + ["Avg edge %", "Consensus"]
     )
@@ -403,7 +453,78 @@ def opportunities_view():
 
     st.dataframe(display, width='stretch', hide_index=True, height=600)
 
-    # -- Expanders --
+    # -- Visuals --
+    # Edge distribution histogram
+    has_edge = wide["Avg edge %"].notna()
+    if has_edge.any():
+        st.markdown("**Edge vs. FanDuel**")
+        edge_data = wide.loc[has_edge, "Avg edge %"]
+        fig_edge = go.Figure()
+        fig_edge.add_trace(go.Histogram(
+            x=edge_data,
+            nbinsx=25,
+            marker_color="cornflowerblue",
+            hovertemplate="Edge: %{x:.1f}pp<br>Players: %{y}<extra></extra>",
+        ))
+        fig_edge.add_vline(x=0, line_dash="solid", line_color="gray", line_width=1.5)
+        fig_edge.update_layout(
+            title="Edge vs. FanDuel",
+            xaxis_title="% Difference between FanDuel Odds vs. Model Odds",
+            yaxis_title="Number of Players",
+            margin=dict(t=40, b=40),
+            height=350,
+        )
+        st.plotly_chart(fig_edge, width='stretch')
+
+    # Model vs. FanDuel scatter
+    with st.expander("Model vs. FanDuel scatter", expanded=True):
+        scatter_has_market = wide["market_implied"].notna()
+        scatter_data = wide[scatter_has_market]
+        if scatter_data.empty:
+            st.info("No players with both model predictions and FanDuel odds.")
+        else:
+            scatter_models = model_prob_cols
+            sc_sel = st.selectbox(
+                "Model to compare",
+                scatter_models,
+                format_func=lambda m: MODEL_NAMES.get(m, m),
+                key="opp_scatter_model",
+            )
+            fd_probs = scatter_data["market_implied"]
+            model_probs = scatter_data[sc_sel]
+            fig_scatter = go.Figure()
+            fig_scatter.add_trace(go.Scatter(
+                x=fd_probs,
+                y=model_probs,
+                mode="markers",
+                marker=dict(size=6, opacity=0.6, color="cornflowerblue"),
+                text=scatter_data["player_name"],
+                hovertemplate=(
+                    "%{text}<br>"
+                    "FanDuel: %{x:.1%}<br>"
+                    + MODEL_NAMES.get(sc_sel, sc_sel)
+                    + ": %{y:.1%}<extra></extra>"
+                ),
+            ))
+            max_val = max(
+                fd_probs.max() if not fd_probs.empty else 0.1,
+                model_probs.max() if not model_probs.empty else 0.1,
+            ) * 1.05
+            fig_scatter.add_trace(go.Scatter(
+                x=[0, max_val], y=[0, max_val],
+                mode="lines", line=dict(dash="dash", color="gray"),
+                showlegend=False,
+            ))
+            fig_scatter.update_layout(
+                title="Predicted vs. FanDuel Odds",
+                xaxis_title="FanDuel (% Chance to Score)",
+                yaxis_title=MODEL_NAMES.get(sc_sel, sc_sel) + " (% Chance to Score)",
+                margin=dict(t=40, b=30),
+                height=400,
+            )
+            st.plotly_chart(fig_scatter, width='stretch')
+
+    # Prediction distributions
     with st.expander("Prediction distributions"):
         if model_prob_cols:
             fig = go.Figure()
@@ -422,36 +543,6 @@ def opportunities_view():
                 height=300,
             )
             st.plotly_chart(fig, width='stretch')
-
-    with st.expander("Model agreement scatter"):
-        if len(model_prob_cols) >= 2:
-            m1, m2 = model_prob_cols[0], model_prob_cols[-1]
-            fig_scatter = go.Figure()
-            fig_scatter.add_trace(go.Scatter(
-                x=wide[m1].dropna(),
-                y=wide[m2].dropna(),
-                mode="markers",
-                marker=dict(size=5, opacity=0.6),
-                text=wide["player_name"],
-                hovertemplate="%{text}<br>" + MODEL_NAMES.get(m1, m1) +
-                              ": %{x:.1%}<br>" + MODEL_NAMES.get(m2, m2) +
-                              ": %{y:.1%}<extra></extra>",
-            ))
-            max_val = max(wide[m1].max(), wide[m2].max()) * 1.05
-            fig_scatter.add_trace(go.Scatter(
-                x=[0, max_val], y=[0, max_val],
-                mode="lines", line=dict(dash="dash", color="gray"),
-                showlegend=False,
-            ))
-            fig_scatter.update_layout(
-                xaxis_title=MODEL_NAMES.get(m1, m1),
-                yaxis_title=MODEL_NAMES.get(m2, m2),
-                margin=dict(t=20, b=30),
-                height=350,
-            )
-            st.plotly_chart(fig_scatter, width='stretch')
-        else:
-            st.info("Need at least 2 models for agreement scatter.")
 
 
 # ---------------------------------------------------------------------------

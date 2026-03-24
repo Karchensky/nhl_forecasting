@@ -195,9 +195,9 @@ nhl_forecasting/
 
 | Model | Role | Calibration | Notes |
 |-------|------|-------------|-------|
-| **Logistic Regression** | Baseline | Platt scaling (CV out-of-fold on training logits) | L1 regularization auto-selects ~287 of 345 features. Predictions clipped to 2-45% as a safety net for OOD inputs. Conservative but stable. |
-| **LightGBM** | Primary | Isotonic regression on validation set | Optuna-tunable. Default params produce predictions tightly concentrated near the 15% base rate; tuning widens the spread. |
-| **XGBoost** | Primary | Isotonic regression on validation set | Best raw performance (lowest logloss, highest AUC). Predictions track FanDuel lines closely on out-of-sample data. |
+| **Logistic Regression** | Baseline | Platt scaling (CV out-of-fold on training logits) | L1 regularization auto-selects ~287 of 345 features. Predictions clipped to 2-45% as a safety net for OOD inputs. Conservative but stable. Not shown by default in the dashboard. |
+| **LightGBM** | Primary | Isotonic regression on validation set | Best overall model (lowest logloss, highest AUC). Optuna-tunable; tuning widens the prediction spread and improves discrimination. |
+| **XGBoost** | Primary | Isotonic regression on validation set | Near-identical to LightGBM. Both tree models track FanDuel lines closely on out-of-sample data. |
 
 ### Validation performance (2024-25, 50K out-of-sample predictions)
 
@@ -207,7 +207,7 @@ nhl_forecasting/
 | LGB | 0.3861 | 0.710 | 0.150 | 0.150 |
 | XGB | 0.3865 | 0.709 | 0.150 | 0.150 |
 
-All three models show monotonic calibration (actual scoring rates increase strictly across all prediction deciles). LightGBM has the best discrimination (AUC 0.710) and calibration. LightGBM and XGBoost both nail the base rate exactly (mean pred = actual rate).
+All three models show monotonic calibration (actual scoring rates increase strictly across all prediction deciles). LightGBM edges out XGBoost for best discrimination (AUC 0.710 vs 0.709) and lowest logloss. Both tree models nail the base rate exactly (mean pred = actual rate). LR underpredicts slightly (14.0% vs 15.0% base rate), consistent with L1 regularization pulling coefficients toward zero.
 
 ### Top features driving predictions (LightGBM gain)
 
