@@ -11,6 +11,7 @@ from database.models import (
     Odds,
     Player,
     PlayerGameStats,
+    ShotEvent,
     Team,
     TeamGameStats,
 )
@@ -85,6 +86,16 @@ def upsert_odds(session: Session, data: dict):
             "implied_probability": clean["implied_probability"],
             "retrieved_at": clean["retrieved_at"],
         },
+    )
+    session.execute(stmt)
+
+
+def upsert_shot_event(session: Session, data: dict):
+    clean = {k: v for k, v in data.items() if k != "id"}
+    stmt = sqlite_insert(ShotEvent.__table__).values(**clean)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["game_id", "event_id"],
+        set_={k: v for k, v in clean.items() if k not in ("game_id", "event_id")},
     )
     session.execute(stmt)
 

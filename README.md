@@ -8,7 +8,7 @@ The goal is straightforward: if our model thinks a player has a 25% chance to sc
 
 ## How it works
 
-1. **Data collection** -- Two NHL APIs provide game schedules, boxscores, and advanced stats (Corsi, Fenwick, zone starts, PP deployment, etc.) going back to the 2020-21 season. The Odds API provides FanDuel player prop lines for today's games.
+1. **Data collection** -- Two NHL APIs provide game schedules, boxscores, play-by-play shot data, and advanced stats (Corsi, Fenwick, zone starts, PP deployment, etc.) going back to the 2020-21 season. The Odds API provides FanDuel player prop lines for today's games.
 
 2. **Feature engineering** -- For each (player, game) row, the pipeline computes ~309 features: rolling averages across 3/5/10/20-game windows, season-to-date stats, opponent defensive quality, goalie performance, schedule context (rest days, back-to-backs), home/road splits, streak indicators, and interaction terms. All features are strictly causal (no future data leakage).
 
@@ -67,19 +67,26 @@ python -m scrapers.nhl_api.fetch_missing_boxscores
 #    This is the longest step -- thousands of API calls. It's resume-aware,
 #    so you can stop and restart safely.
 python -m scrapers.nhl_stats_api.backfill
+
+# 4. Backfill play-by-play shot events (for the xG model).
+#    Resume-aware -- safe to stop and restart. Uses 2 workers to stay under API rate limits.
+python -m scrapers.nhl_api.backfill_pbp --workers 2
 ```
 
 ### Training models
 
 ```bash
-# Full training with Optuna hyperparameter tuning (can take 2-4 hours)
+# 1. Train the xG model first (it feeds into the main models as features)
+python -m models.xg_model
+
+# 2. Full training with Optuna hyperparameter tuning (can take 2-4 hours)
 python models/run_training.py
 
 # Quick training without tuning (5-10 minutes)
 python models/run_training.py --no-tune
 ```
 
-This saves three model files to `models/saved/`: `logistic_regression.pkl`, `lightgbm.pkl`, `xgboost.pkl`.
+This saves model files to `models/saved/`: `xg_model.pkl`, `logistic_regression.pkl`, `lightgbm.pkl`, `xgboost.pkl`.
 
 ---
 
@@ -100,8 +107,9 @@ The daily job does the following in order:
 1. Fetches games from the last few days + upcoming schedule
 2. Pulls boxscores for any newly completed games
 3. Enriches completed games with Stats API advanced stats
-4. Fetches FanDuel anytime goal scorer odds for today's games
-5. Generates predictions for today's games using all three models
+4. Ingests play-by-play shot events for newly completed games (feeds the xG model)
+5. Fetches FanDuel anytime goal scorer odds for today's games
+6. Generates predictions for today's games using all three models
 
 Run it before puck drop. The Streamlit dashboard will then show today's slate with edges.
 
@@ -145,6 +153,7 @@ nhl_forecasting/
 |   |   |-- client.py            # Schedule, boxscore, roster, play-by-play endpoints
 |   |   |-- parsers.py           # Parse boxscore JSON into player/goalie/team stats
 |   |   |-- backfill.py          # Bulk historical data ingestion
+|   |   |-- backfill_pbp.py     # Resume-aware play-by-play shot event backfill
 |   |   |-- fetch_missing_boxscores.py
 |   |   |-- refresh_rosters.py
 |   |
@@ -158,7 +167,8 @@ nhl_forecasting/
 |       |-- odds_matching.py     # Fuzzy name matching between Odds API and NHL DB
 |
 |-- models/
-|   |-- feature_engineering.py   # 309 features: rolling stats, opponent quality, context, etc.
+|   |-- feature_engineering.py   # ~350 features: rolling stats, xG, opponent quality, context, etc.
+|   |-- xg_model.py             # Expected goals model (shot-level LightGBM classifier)
 |   |-- training.py              # Train LR/LGB/XGB with calibration and time-decay weights
 |   |-- inference.py             # Load models, score today's games, store predictions
 |   |-- evaluation.py            # Logloss, Brier, AUC, calibration tables, lift tables
@@ -199,23 +209,52 @@ These are honest out-of-sample numbers -- the test season was never seen during 
 
 ---
 
+## Expected Goals (xG) model
+
+The xG model is a shot-level LightGBM binary classifier that predicts the probability of each shot becoming a goal. It uses play-by-play data from the NHL API and feeds into the main goal-scoring models as features.
+
+### xG shot features
+
+- **Spatial** -- distance to net, angle, x/y coordinates, distance squared, angle squared, distance x angle interaction
+- **Shot type** -- one-hot encoding of wrist, snap, slap, backhand, tip-in, deflected, wrap-around, poke, bat, between-legs, cradle
+- **Game state** -- period, time in period, overtime flag, score differential (trailing/tied/leading), strength state (PP/SH/5v5), empty net
+- **Shot sequence** -- time since last shot (any team), rebound (shot within 3s of prior), rush (3-5s), same-team prior shot (sustained pressure), prior shot was a goal, distance/angle change from prior shot, shots in last 10 seconds (flurry)
+
+The xG model is trained once on all available shot data, calibrated via isotonic regression on a validation season, and saved to `models/saved/xg_model.pkl`.
+
+### xG features in the main models
+
+Per-player-per-game xG totals are aggregated and turned into rolling features at all four windows (3/5/10/20 games):
+
+- **xG total** and **xG per 60** -- how many expected goals the player generates from shot quality + volume
+- **Goals above expected** -- actual goals minus xG (positive = elite finisher, negative = unlucky or poor finisher)
+- **Finishing percentage** -- actual goals / xG (sustainability indicator)
+- **xG trend** -- short-window xG vs long-window xG (is xG rising or falling?)
+- **Finishing consistency** -- std dev of goals-above-expected (low = reliable, high = streaky)
+- **Teammate xG quality** -- mean xG of teammates in the same game (offensive environment quality)
+- **Opponent xG against** -- how much xG the opponent allows per game (defensive weakness)
+- **xG x opponent interaction** -- player xG rate x opponent xG-against (matchup quality)
+
+---
+
 ## Feature overview
 
-The 309 features fall into these groups:
+The ~350 features fall into these groups:
 
 - **Rolling player stats** (4 windows: 3/5/10/20 games) -- goals, assists, shots, TOI, PP time, Corsi/Fenwick, zone starts, shooting %, etc.
+- **xG-derived** (4 windows) -- xG totals, xG/60, goals above expected, finishing %, xG trend, teammate/opponent xG context
 - **Season cumulative** -- goals, shots, games played, shooting %, goals per 60
 - **Team rolling** -- team goals, shots, PP %, win rate
 - **PP deployment** -- player's share of team power play time
-- **Teammate context** -- average linemate scoring rate
-- **Opponent defense** (4 windows) -- goals against, shots against, PK %, 5v5 GA
+- **Teammate context** -- average linemate scoring rate and xG quality
+- **Opponent defense** (4 windows) -- goals against, shots against, PK %, 5v5 GA, xG against
 - **Goalie quality** (4 windows) -- opposing goalie save % and GA average
 - **Schedule context** -- rest days, back-to-back, games in last 7 days (player and opponent)
 - **Player profile** -- position, age
 - **Home/road splits** (4 windows) -- venue-specific goal and shot rates
 - **vs. opponent history** -- career scoring rate against this team
 - **Streaks/momentum** -- recent scoring, shot trends, games since last goal
-- **Interaction terms** -- shot rate x opponent weakness, PP time x opponent penalties, etc.
+- **Interaction terms** -- shot rate x opponent weakness, PP time x opponent penalties, xG x opponent xG-against, etc.
 
 All features use a `shift(1)` offset so they only reflect information available before the game starts.
 
@@ -258,10 +297,73 @@ The implied probability is `1 / decimal_odds` or the standard American-to-implie
 
 ---
 
+## Retraining the xG model
+
+The xG model trains on shot-level play-by-play data and should be retrained when you have significantly more data (e.g., a new season). Retraining is quick (under a minute on ~800K shots).
+
+```bash
+# 1. Make sure PBP data is up to date (resume-aware, safe to re-run)
+python -m scrapers.nhl_api.backfill_pbp --workers 2
+
+# 2. Retrain the xG model
+python -m models.xg_model
+
+# 3. Retrain the main models (they'll pick up the updated xG features automatically)
+python models/run_training.py --no-tune    # quick
+python models/run_training.py              # with Optuna tuning (slower, better)
+```
+
+The xG model will print AUC, log loss, and Brier score for train/val/test splits, plus the top 15 most important features.
+
+### xG model performance (900K shots, 7,669 games)
+
+| Split | AUC | LogLoss | Brier | Mean Pred | Actual Rate |
+|-------|-----|---------|-------|-----------|-------------|
+| Train (600K shots, 2020-24) | 0.843 | 0.164 | 0.045 | 5.22% | 5.39% |
+| Val (168K shots, 2024-25) | 0.842 | 0.158 | 0.043 | 5.13% | 5.13% |
+| Test (131K shots, 2025-26) | 0.834 | 0.166 | 0.045 | 5.41% | 5.38% |
+
+These are strong numbers for xG -- comparable to public models like MoneyPuck. The near-zero train-val gap (0.843 vs 0.842 AUC) shows the model generalizes well. Calibration is tight: predicted and actual goal rates differ by less than 0.2 percentage points across all splits.
+
+Top features: shot distance, shot type, offensive zone indicator, empty net, distance-angle interaction, rebounds, and shot flurries.
+
+### New season checklist
+
+At the start of a new NHL season:
+
+1. **Update `config/settings.yaml`** -- add the new season to `seasons`, shift `validation_season` and `test_season` forward by one year.
+
+2. **Backfill the new season** once games start being played:
+
+   ```bash
+   python -m scrapers.nhl_api.backfill
+   python -m scrapers.nhl_api.fetch_missing_boxscores
+   python -m scrapers.nhl_stats_api.backfill
+   python -m scrapers.nhl_api.backfill_pbp --workers 2
+   ```
+
+3. **Retrain all models** (the old season's validation set becomes part of training):
+
+   ```bash
+   python -m models.xg_model
+   python models/run_training.py
+   ```
+
+4. **Refresh rosters** for new acquisitions:
+
+   ```bash
+   python -m scrapers.nhl_api.refresh_rosters
+   ```
+
+5. Resume daily operations with `python scheduler/daily_job.py`.
+
+---
+
 ## Notes
 
 - The database is SQLite with WAL journaling. It lives at `data/nhl_forecasting.db` by default.
 - Only regular season (game_type=2) and playoff (game_type=3) games are used. Preseason is filtered out.
 - The daily job only generates predictions for today's date to avoid stale rolling features for future games.
 - Model pickles include the feature column list, scaler (LR only), and calibrator. If you change the feature engineering code, you must retrain.
-- The Stats API enrichment is resume-aware. If it gets interrupted, just run it again and it will pick up where it left off.
+- The Stats API enrichment and PBP backfill are both resume-aware. If interrupted, just run them again and they'll pick up where they left off.
+- The xG model is a dependency of the main models. If you retrain the xG model, you should also retrain the main models so the xG features are consistent.

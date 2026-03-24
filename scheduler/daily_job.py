@@ -15,12 +15,13 @@ from database.ingestion import (
     upsert_goalie_game_stats,
     upsert_player,
     upsert_player_game_stats,
+    upsert_shot_event,
     upsert_team_game_stats,
 )
 from database.models import PlayerGameStats, TeamGameStats
 from scrapers.nhl_api.backfill import _update_team_names_from_game
 from scrapers.nhl_api.client import NHLApiClient
-from scrapers.nhl_api.parsers import parse_boxscore, parse_schedule
+from scrapers.nhl_api.parsers import parse_boxscore, parse_play_by_play, parse_schedule
 from scrapers.nhl_stats_api.client import NHLStatsApiClient
 from scrapers.nhl_stats_api.parsers import SKATER_REPORTS, TEAM_REPORTS
 from utils.config import load_config
@@ -101,6 +102,46 @@ def update_recent_games(client: NHLApiClient, days_back: int = 3):
             logger.error("Failed to update game %s: %s", gid, e)
 
     return completed_game_ids
+
+
+def ingest_play_by_play(client: NHLApiClient, game_ids: set[int]):
+    """Fetch and store play-by-play shot events for recently completed games.
+
+    Skips games that already have shot_events rows (idempotent).
+    """
+    if not game_ids:
+        return
+
+    engine = get_engine()
+    with engine.connect() as conn:
+        existing = {
+            r[0]
+            for r in conn.execute(
+                sa_text("SELECT DISTINCT game_id FROM shot_events")
+            ).fetchall()
+        }
+    to_fetch = game_ids - existing
+    if not to_fetch:
+        logger.info("All %d games already have PBP shot events.", len(game_ids))
+        return
+
+    logger.info("Fetching PBP shot events for %d games...", len(to_fetch))
+    total = 0
+    for gid in to_fetch:
+        try:
+            data = client.get_play_by_play(gid)
+            if not data:
+                continue
+            records = parse_play_by_play(data, gid)
+            if records:
+                with get_session() as session:
+                    for r in records:
+                        upsert_shot_event(session, r)
+                total += len(records)
+        except Exception as e:
+            logger.error("PBP fetch failed for game %s: %s", gid, e)
+
+    logger.info("Stored %d shot events across %d games.", total, len(to_fetch))
 
 
 def enrich_games_with_stats_api(game_ids: set[int]):
@@ -264,6 +305,7 @@ def run_daily():
 
     completed = update_recent_games(client, days_back=3)
     enrich_games_with_stats_api(completed)
+    ingest_play_by_play(client, completed)
     fetch_odds()
     run_predictions()
 

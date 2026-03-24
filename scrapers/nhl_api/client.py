@@ -79,3 +79,6 @@ class NHLApiClient:
 
     def get_schedule_date(self, date_str: str) -> dict | None:
         return self.get(f"schedule/{date_str}")
+
+    def get_play_by_play(self, game_id: int) -> dict | None:
+        return self.get(f"gamecenter/{game_id}/play-by-play")

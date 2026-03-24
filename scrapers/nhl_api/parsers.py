@@ -236,3 +236,95 @@ def parse_boxscore(data: dict) -> tuple[list[dict], list[dict], list[dict]]:
         })
 
     return player_stats, goalie_stats, team_stats
+
+
+# ---------------------------------------------------------------------------
+# Play-by-play shot event parser
+# ---------------------------------------------------------------------------
+
+_SHOT_EVENT_TYPES = frozenset({"goal", "shot-on-goal", "missed-shot", "blocked-shot"})
+
+# Net center coordinates (both ends of the rink)
+_NET_X = 89.0
+_NET_Y = 0.0
+
+
+def _compute_distance_and_angle(x: float | None, y: float | None) -> tuple[float | None, float | None]:
+    """Compute distance (feet) and angle (degrees) from net center.
+
+    The rink is symmetric: shots in the offensive zone can target either
+    end.  We normalise so the net is always at x=+89.
+    """
+    if x is None or y is None:
+        return None, None
+    import math
+    # Normalise: offensive shots can be at either end
+    ax = abs(x)
+    dx = _NET_X - ax
+    dy = y - _NET_Y
+    dist = math.sqrt(dx * dx + dy * dy)
+    angle = math.degrees(math.atan2(abs(dy), max(dx, 0.01)))
+    return round(dist, 1), round(angle, 1)
+
+
+def _time_str_to_seconds(t: str) -> int:
+    """Convert 'MM:SS' to total seconds."""
+    parts = t.split(":")
+    if len(parts) == 2:
+        return int(parts[0]) * 60 + int(parts[1])
+    return 0
+
+
+def parse_play_by_play(data: dict, game_id: int) -> list[dict]:
+    """Extract shot events from a play-by-play response.
+
+    Returns a list of dicts ready for ``upsert_shot_event``.
+    """
+    plays = data.get("plays", [])
+    records: list[dict] = []
+
+    for play in plays:
+        etype = play.get("typeDescKey", "")
+        if etype not in _SHOT_EVENT_TYPES:
+            continue
+
+        details = play.get("details", {})
+        period_desc = play.get("periodDescriptor", {})
+
+        x = details.get("xCoord")
+        y = details.get("yCoord")
+        distance, angle = _compute_distance_and_angle(x, y)
+
+        # For blocked-shot the shooter key differs
+        shooter = (
+            details.get("shootingPlayerId")
+            or details.get("scoringPlayerId")
+        )
+        if not shooter:
+            continue
+
+        goalie = details.get("goalieInNetId")  # None = empty net
+
+        records.append({
+            "game_id": game_id,
+            "event_id": play.get("eventId"),
+            "period": period_desc.get("number", 0),
+            "period_type": period_desc.get("periodType", "REG"),
+            "time_in_period_seconds": _time_str_to_seconds(
+                play.get("timeInPeriod", "00:00")
+            ),
+            "event_type": etype,
+            "x_coord": float(x) if x is not None else None,
+            "y_coord": float(y) if y is not None else None,
+            "zone_code": details.get("zoneCode"),
+            "shot_type": details.get("shotType"),
+            "shooter_id": int(shooter),
+            "goalie_id": int(goalie) if goalie else None,
+            "team_id": int(details.get("eventOwnerTeamId", 0)),
+            "situation_code": play.get("situationCode"),
+            "is_goal": etype == "goal",
+            "distance": distance,
+            "angle": angle,
+        })
+
+    return records

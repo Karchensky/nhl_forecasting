@@ -1,5 +1,6 @@
 """NHL Goal Probability Model -- Streamlit Dashboard."""
 
+import pickle
 import sys
 from datetime import date
 from pathlib import Path
@@ -26,7 +27,6 @@ st.set_page_config(
     layout="wide",
 )
 
-# Suppress default Streamlit top padding
 st.markdown(
     "<style>div.block-container{padding-top:1.5rem;}</style>",
     unsafe_allow_html=True,
@@ -46,6 +46,8 @@ MODEL_DISPLAY = {
 TRAIN_SEASONS = {20202021, 20212022, 20222023, 20232024}
 VAL_SEASON = 20242025
 TEST_SEASON = 20252026
+
+MODEL_DIR = Path(__file__).resolve().parent.parent / "models" / "saved"
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +129,23 @@ def load_historical_results():
     return pd.read_sql(query, engine)
 
 
+@st.cache_data(ttl=600)
+def load_shot_events_summary():
+    """Load shot event aggregates for xG diagnostics."""
+    engine = get_engine()
+    query = """
+        SELECT
+            se.event_type, se.shot_type, se.is_goal,
+            se.distance, se.angle, se.x_coord, se.y_coord,
+            se.situation_code, se.period,
+            g.season
+        FROM shot_events se
+        JOIN games g ON se.game_id = g.game_id
+        WHERE g.game_state IN ('FINAL', 'OFF')
+    """
+    return pd.read_sql(query, engine)
+
+
 def _line_from_p(p) -> str:
     if pd.isna(p):
         return "--"
@@ -144,6 +163,30 @@ def _split_label(season: int) -> str:
     if season == TEST_SEASON:
         return "TEST"
     return "OTHER"
+
+
+def _load_saved_model_artifact(name: str) -> dict | None:
+    """Load a saved model pickle for feature importance inspection."""
+    path = MODEL_DIR / f"{name}.pkl"
+    if not path.exists():
+        return None
+    try:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        return None
+
+
+def _load_xg_artifact() -> dict | None:
+    """Load the saved xG model artifact."""
+    path = MODEL_DIR / "xg_model.pkl"
+    if not path.exists():
+        return None
+    try:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +209,7 @@ def opportunities_view():
         return
 
     # -- Filters row --
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
         today = date.today()
         default_idx = 0
@@ -208,8 +251,14 @@ def opportunities_view():
     if team_pick:
         work = work[work["player_team"].isin(team_pick)]
 
-    all_models = sorted(work["model_version"].unique().tolist())
+    positions = sorted(work["position"].dropna().unique().tolist())
     with c4:
+        pos_pick = st.multiselect("Position", options=positions, default=positions, key="opp_pos")
+    if pos_pick:
+        work = work[work["position"].isin(pos_pick)]
+
+    all_models = sorted(work["model_version"].unique().tolist())
+    with c5:
         model_pick = st.multiselect(
             "Models",
             options=all_models,
@@ -289,6 +338,14 @@ def opportunities_view():
     else:
         wide["_best_edge"] = np.nan
 
+    # Model consensus: how many models agree on +EV
+    if edge_cols:
+        edge_mat = wide[edge_cols].to_numpy(dtype=float)
+        wide["Consensus"] = np.nansum(edge_mat > 0, axis=1).astype(int)
+        wide["Consensus"] = wide["Consensus"].astype(str) + "/" + str(len(edge_cols))
+    else:
+        wide["Consensus"] = "--"
+
     wide["Rank"] = (
         wide["_best_edge"]
         .rank(method="min", ascending=False)
@@ -304,17 +361,19 @@ def opportunities_view():
 
     # -- Summary KPIs --
     has_market = wide["market_implied"].notna()
+    n_players = len(wide)
     n_with_odds = int(has_market.sum())
     n_positive_ev = int((wide["_best_edge"] > 0).sum()) if edge_cols else 0
     avg_edge = float(wide.loc[wide["_best_edge"] > 0, "_best_edge"].mean()) if n_positive_ev else 0.0
     top_edge = float(wide["_best_edge"].max()) if edge_cols and not wide["_best_edge"].isna().all() else 0.0
 
-    k1, k2, k3, k4, k5 = st.columns(5)
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
     k1.metric("Slate", selected_date.isoformat())
-    k2.metric("Players w/ odds", n_with_odds)
-    k3.metric("+EV plays", n_positive_ev)
-    k4.metric("Avg edge (pp)", f"{avg_edge:+.1f}" if avg_edge else "--")
-    k5.metric("Best edge (pp)", f"{top_edge:+.1f}" if top_edge else "--")
+    k2.metric("Players", n_players)
+    k3.metric("w/ FD odds", n_with_odds)
+    k4.metric("+EV plays", n_positive_ev)
+    k5.metric("Avg +EV edge", f"{avg_edge:+.1f}pp" if avg_edge else "--")
+    k6.metric("Best edge", f"{top_edge:+.1f}pp" if top_edge else "--")
 
     # -- Main table --
     out_cols = (
@@ -323,7 +382,7 @@ def opportunities_view():
         + [MODEL_DISPLAY[m][0] for m in model_pick if m in wide.columns]
         + ["FD Line", "FD %"]
         + [MODEL_DISPLAY[m][1] for m in model_pick if m in wide.columns]
-        + ["Avg model line"]
+        + ["Consensus", "Avg model line"]
     )
     out_cols = [c for c in out_cols if c in wide.columns]
     display = wide[out_cols].copy()
@@ -335,9 +394,9 @@ def opportunities_view():
         "away_team": "Away",
     })
 
-    st.dataframe(display, width='stretch', hide_index=True, height=600)
+    st.dataframe(display, use_container_width=True, hide_index=True, height=600)
 
-    # -- Histogram expander --
+    # -- Expanders --
     with st.expander("Prediction distributions"):
         if model_prob_cols:
             fig = go.Figure()
@@ -355,7 +414,37 @@ def opportunities_view():
                 margin=dict(t=30, b=30),
                 height=300,
             )
-            st.plotly_chart(fig, width='stretch')
+            st.plotly_chart(fig, use_container_width=True)
+
+    with st.expander("Model agreement scatter"):
+        if len(model_prob_cols) >= 2:
+            m1, m2 = model_prob_cols[0], model_prob_cols[-1]
+            fig_scatter = go.Figure()
+            fig_scatter.add_trace(go.Scatter(
+                x=wide[m1].dropna(),
+                y=wide[m2].dropna(),
+                mode="markers",
+                marker=dict(size=5, opacity=0.6),
+                text=wide["player_name"],
+                hovertemplate="%{text}<br>" + MODEL_NAMES.get(m1, m1) +
+                              ": %{x:.1%}<br>" + MODEL_NAMES.get(m2, m2) +
+                              ": %{y:.1%}<extra></extra>",
+            ))
+            max_val = max(wide[m1].max(), wide[m2].max()) * 1.05
+            fig_scatter.add_trace(go.Scatter(
+                x=[0, max_val], y=[0, max_val],
+                mode="lines", line=dict(dash="dash", color="gray"),
+                showlegend=False,
+            ))
+            fig_scatter.update_layout(
+                xaxis_title=MODEL_NAMES.get(m1, m1),
+                yaxis_title=MODEL_NAMES.get(m2, m2),
+                margin=dict(t=20, b=30),
+                height=350,
+            )
+            st.plotly_chart(fig_scatter, use_container_width=True)
+        else:
+            st.info("Need at least 2 models for agreement scatter.")
 
 
 # ---------------------------------------------------------------------------
@@ -415,6 +504,7 @@ def diagnostics_view():
     st.subheader("Model comparison")
     model_versions = sorted(preds_f["model_version"].unique().tolist())
     comp_rows = []
+    model_merged_cache = {}
     for mv in model_versions:
         merged = preds_f[preds_f["model_version"] == mv].merge(
             results_f[["player_id", "game_id", "goals"]],
@@ -423,6 +513,7 @@ def diagnostics_view():
         )
         if merged.empty:
             continue
+        model_merged_cache[mv] = merged
         y_true = (merged["goals"] >= 1).astype(int).values
         y_prob = merged["predicted_probability"].values
         m = compute_core_metrics(y_true, y_prob)
@@ -437,7 +528,7 @@ def diagnostics_view():
             "Pred/Base": round(m["mean_predicted"] / max(m["base_rate"], 1e-6), 3),
         })
     if comp_rows:
-        st.dataframe(pd.DataFrame(comp_rows), width='stretch', hide_index=True)
+        st.dataframe(pd.DataFrame(comp_rows), use_container_width=True, hide_index=True)
     else:
         st.warning("No overlapping predictions and results for selected seasons.")
         return
@@ -454,12 +545,8 @@ def diagnostics_view():
             key="diag_model",
         )
 
-    merged = preds_f[preds_f["model_version"] == selected_model].merge(
-        results_f[["player_id", "game_id", "goals"]],
-        on=["player_id", "game_id"],
-        how="inner",
-    )
-    if merged.empty:
+    merged = model_merged_cache.get(selected_model)
+    if merged is None or merged.empty:
         st.warning("No overlapping data for this model/season selection.")
         return
 
@@ -497,7 +584,7 @@ def diagnostics_view():
             height=350,
             showlegend=True,
         )
-        st.plotly_chart(fig_cal, width='stretch')
+        st.plotly_chart(fig_cal, use_container_width=True)
 
     with right:
         st.markdown("**Lift by decile**")
@@ -510,7 +597,7 @@ def diagnostics_view():
             margin=dict(t=20, b=30),
             height=350,
         )
-        st.plotly_chart(fig_lift, width='stretch')
+        st.plotly_chart(fig_lift, use_container_width=True)
 
     # -- Calibration table + cumulative gains --
     left2, right2 = st.columns(2)
@@ -520,7 +607,7 @@ def diagnostics_view():
         cal_d["actual_rate"] = (cal_d["actual_rate"] * 100).round(2)
         cal_d["predicted_mean"] = (cal_d["predicted_mean"] * 100).round(2)
         cal_d["abs_error"] = cal_d["abs_error"].round(4)
-        st.dataframe(cal_d, width='stretch', hide_index=True)
+        st.dataframe(cal_d, use_container_width=True, hide_index=True)
 
     with right2:
         st.markdown("**Cumulative gains**")
@@ -531,7 +618,95 @@ def diagnostics_view():
             margin=dict(t=20, b=30),
             height=300,
         )
-        st.plotly_chart(fig_gains, width='stretch')
+        st.plotly_chart(fig_gains, use_container_width=True)
+
+    # -- Prediction distribution overlay --
+    st.markdown("**Prediction distribution (all models)**")
+    fig_dist = go.Figure()
+    for mv in model_versions:
+        mv_merged = model_merged_cache.get(mv)
+        if mv_merged is None:
+            continue
+        fig_dist.add_trace(go.Histogram(
+            x=mv_merged["predicted_probability"],
+            name=MODEL_NAMES.get(mv, mv),
+            opacity=0.5,
+            nbinsx=40,
+        ))
+    fig_dist.update_layout(
+        barmode="overlay",
+        xaxis_title="Predicted Probability",
+        yaxis_title="Count",
+        margin=dict(t=20, b=30),
+        height=300,
+    )
+    st.plotly_chart(fig_dist, use_container_width=True)
+
+    # -- Per-position breakdown --
+    with st.expander("Performance by position"):
+        merged_with_pos = merged.copy()
+        if "position" in merged_with_pos.columns:
+            pos_groups = {"Forward": ["C", "L", "R", "LW", "RW"], "Defense": ["D"]}
+            rows_pos = []
+            for label, pos_list in pos_groups.items():
+                mask = merged_with_pos["position"].isin(pos_list)
+                subset = merged_with_pos[mask]
+                if len(subset) < 50:
+                    continue
+                yt = (subset["goals"] >= 1).astype(int).values
+                yp = subset["predicted_probability"].values
+                m = compute_core_metrics(yt, yp)
+                rows_pos.append({
+                    "Position": label,
+                    "Samples": m["n_samples"],
+                    "Base Rate": f"{m['base_rate']:.3f}",
+                    "Mean Pred": f"{m['mean_predicted']:.3f}",
+                    "Log Loss": f"{m['log_loss']:.4f}",
+                    "AUC": f"{m['roc_auc']:.4f}",
+                    "Brier": f"{m['brier_score']:.4f}",
+                })
+            if rows_pos:
+                st.dataframe(pd.DataFrame(rows_pos), use_container_width=True, hide_index=True)
+            else:
+                st.info("Not enough data per position group.")
+
+    # -- Feature importance --
+    with st.expander("Feature importance (top 30)"):
+        artifact = _load_saved_model_artifact(selected_model)
+        if artifact and "model" in artifact:
+            model_obj = artifact["model"]
+            feature_cols = artifact.get("feature_cols", [])
+            importances = None
+
+            if selected_model == "lightgbm":
+                importances = model_obj.feature_importance(importance_type="gain")
+            elif selected_model == "xgboost":
+                score_dict = model_obj.get_score(importance_type="gain")
+                importances = [score_dict.get(f, 0) for f in feature_cols]
+            elif selected_model == "logistic_regression":
+                if hasattr(model_obj, "coef_"):
+                    importances = np.abs(model_obj.coef_[0])
+
+            if importances is not None and len(importances) == len(feature_cols):
+                imp_df = pd.DataFrame({
+                    "Feature": feature_cols,
+                    "Importance": importances,
+                }).sort_values("Importance", ascending=False).head(30)
+
+                fig_imp = px.bar(
+                    imp_df, x="Importance", y="Feature",
+                    orientation="h",
+                )
+                fig_imp.update_layout(
+                    yaxis=dict(autorange="reversed"),
+                    margin=dict(t=20, b=30, l=200),
+                    height=max(400, len(imp_df) * 18),
+                )
+                st.plotly_chart(fig_imp, use_container_width=True)
+            else:
+                st.info("Could not extract feature importances for this model type.")
+        else:
+            st.info(f"No saved model artifact found for {MODEL_NAMES.get(selected_model, selected_model)}.")
 
     # -- Data coverage --
     with st.expander("Data coverage"):
@@ -549,7 +724,218 @@ def diagnostics_view():
 
 
 # ---------------------------------------------------------------------------
-# Tab 3 -- Edge Backtest
+# Tab 3 -- xG Model Diagnostics
+# ---------------------------------------------------------------------------
+
+def xg_diagnostics_view():
+    st.subheader("Expected Goals (xG) Model")
+
+    artifact = _load_xg_artifact()
+    if artifact is None:
+        st.info("No trained xG model found. Run `python -m models.xg_model` first.")
+        return
+
+    model_results = artifact.get("results", {})
+    feature_cols = artifact.get("feature_cols", [])
+    model = artifact.get("model")
+
+    # -- Performance metrics table --
+    st.markdown("**Model performance**")
+    perf_rows = []
+    for split in ["train", "val", "test"]:
+        r = model_results.get(split, {})
+        if r:
+            perf_rows.append({
+                "Split": split.upper(),
+                "AUC": round(r["auc"], 4),
+                "Log Loss": round(r["log_loss"], 4),
+                "Brier": round(r["brier"], 4),
+            })
+    if perf_rows:
+        st.dataframe(pd.DataFrame(perf_rows), use_container_width=True, hide_index=True)
+    else:
+        st.warning("No evaluation results stored in xG model artifact.")
+
+    # -- Feature importance --
+    if model is not None and feature_cols:
+        st.markdown("**Top 20 features (gain)**")
+        imp_vals = model.feature_importance(importance_type="gain")
+        imp_df = pd.DataFrame({
+            "Feature": feature_cols,
+            "Importance": imp_vals,
+        }).sort_values("Importance", ascending=False).head(20)
+
+        fig_imp = px.bar(imp_df, x="Importance", y="Feature", orientation="h")
+        fig_imp.update_layout(
+            yaxis=dict(autorange="reversed"),
+            margin=dict(t=20, b=30, l=180),
+            height=max(400, len(imp_df) * 20),
+        )
+        st.plotly_chart(fig_imp, use_container_width=True)
+
+    # -- Shot data analysis --
+    shots_df = load_shot_events_summary()
+    if shots_df.empty:
+        st.info("No shot event data. Run backfill_pbp first.")
+        return
+
+    st.markdown("---")
+    st.subheader("Shot data overview")
+
+    k1, k2, k3, k4 = st.columns(4)
+    total_shots = len(shots_df)
+    total_goals = int(shots_df["is_goal"].sum())
+    goal_rate = total_goals / total_shots * 100 if total_shots else 0
+    n_seasons = shots_df["season"].nunique()
+    k1.metric("Total shots", f"{total_shots:,}")
+    k2.metric("Goals", f"{total_goals:,}")
+    k3.metric("Goal rate", f"{goal_rate:.2f}%")
+    k4.metric("Seasons", n_seasons)
+
+    # -- Goal rate by shot type --
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**Goal rate by shot type**")
+        st_df = (
+            shots_df[shots_df["shot_type"].notna()]
+            .groupby("shot_type")
+            .agg(shots=("is_goal", "count"), goals=("is_goal", "sum"))
+            .reset_index()
+        )
+        st_df["goal_pct"] = (st_df["goals"] / st_df["shots"] * 100).round(2)
+        st_df = st_df.sort_values("goal_pct", ascending=False)
+
+        fig_st = px.bar(st_df, x="goal_pct", y="shot_type", orientation="h",
+                        text="shots", labels={"goal_pct": "Goal %", "shot_type": "Shot Type"})
+        fig_st.update_layout(
+            yaxis=dict(autorange="reversed"),
+            margin=dict(t=20, b=30, l=120),
+            height=350,
+        )
+        st.plotly_chart(fig_st, use_container_width=True)
+
+    with right:
+        st.markdown("**Goal rate by game situation**")
+        sit_df = shots_df[shots_df["situation_code"].notna()].copy()
+        sit_labels = {
+            "1551": "5v5",
+            "1541": "Home PP (5v4)",
+            "1451": "Away PP (5v4)",
+            "1531": "Home PP (5v3)",
+            "1351": "Away PP (5v3)",
+            "0551": "Home EN",
+            "1550": "Away EN",
+        }
+        sit_df["situation"] = sit_df["situation_code"].map(sit_labels).fillna("Other")
+        sit_agg = (
+            sit_df.groupby("situation")
+            .agg(shots=("is_goal", "count"), goals=("is_goal", "sum"))
+            .reset_index()
+        )
+        sit_agg["goal_pct"] = (sit_agg["goals"] / sit_agg["shots"] * 100).round(2)
+        sit_agg = sit_agg[sit_agg["shots"] >= 100].sort_values("goal_pct", ascending=False)
+
+        fig_sit = px.bar(sit_agg, x="goal_pct", y="situation", orientation="h",
+                         text="shots", labels={"goal_pct": "Goal %", "situation": "Situation"})
+        fig_sit.update_layout(
+            yaxis=dict(autorange="reversed"),
+            margin=dict(t=20, b=30, l=120),
+            height=350,
+        )
+        st.plotly_chart(fig_sit, use_container_width=True)
+
+    # -- Distance/angle vs goal rate --
+    left2, right2 = st.columns(2)
+    with left2:
+        st.markdown("**Goal rate by distance**")
+        dist_df = shots_df[shots_df["distance"].notna()].copy()
+        dist_df["dist_bin"] = pd.cut(dist_df["distance"], bins=range(0, 100, 5))
+        dist_agg = (
+            dist_df.groupby("dist_bin", observed=True)
+            .agg(shots=("is_goal", "count"), goals=("is_goal", "sum"))
+            .reset_index()
+        )
+        dist_agg["goal_pct"] = (dist_agg["goals"] / dist_agg["shots"] * 100).round(2)
+        dist_agg["distance"] = dist_agg["dist_bin"].apply(lambda x: x.mid)
+
+        fig_dist = px.line(dist_agg, x="distance", y="goal_pct",
+                           labels={"distance": "Distance (ft)", "goal_pct": "Goal %"},
+                           markers=True)
+        fig_dist.update_layout(margin=dict(t=20, b=30), height=300)
+        st.plotly_chart(fig_dist, use_container_width=True)
+
+    with right2:
+        st.markdown("**Goal rate by angle**")
+        angle_df = shots_df[shots_df["angle"].notna()].copy()
+        angle_df["angle_bin"] = pd.cut(angle_df["angle"], bins=range(0, 95, 5))
+        angle_agg = (
+            angle_df.groupby("angle_bin", observed=True)
+            .agg(shots=("is_goal", "count"), goals=("is_goal", "sum"))
+            .reset_index()
+        )
+        angle_agg["goal_pct"] = (angle_agg["goals"] / angle_agg["shots"] * 100).round(2)
+        angle_agg["angle"] = angle_agg["angle_bin"].apply(lambda x: x.mid)
+
+        fig_angle = px.line(angle_agg, x="angle", y="goal_pct",
+                            labels={"angle": "Angle (degrees)", "goal_pct": "Goal %"},
+                            markers=True)
+        fig_angle.update_layout(margin=dict(t=20, b=30), height=300)
+        st.plotly_chart(fig_angle, use_container_width=True)
+
+    # -- Shot location heatmap --
+    with st.expander("Shot location heatmap"):
+        loc_df = shots_df[shots_df["x_coord"].notna() & shots_df["y_coord"].notna()].copy()
+        loc_df["x_abs"] = loc_df["x_coord"].abs()
+
+        fig_heat = go.Figure()
+        fig_heat.add_trace(go.Histogram2d(
+            x=loc_df["x_abs"],
+            y=loc_df["y_coord"],
+            colorscale="YlOrRd",
+            nbinsx=50,
+            nbinsy=50,
+            colorbar=dict(title="Shots"),
+        ))
+        fig_heat.update_layout(
+            xaxis_title="X (distance from center ice)",
+            yaxis_title="Y (lateral position)",
+            margin=dict(t=20, b=30),
+            height=400,
+            width=600,
+        )
+        st.plotly_chart(fig_heat, use_container_width=True)
+
+    # -- Per-period goal rate --
+    with st.expander("Goal rate by period"):
+        period_df = (
+            shots_df[shots_df["period"].between(1, 5)]
+            .groupby("period")
+            .agg(shots=("is_goal", "count"), goals=("is_goal", "sum"))
+            .reset_index()
+        )
+        period_df["goal_pct"] = (period_df["goals"] / period_df["shots"] * 100).round(2)
+        period_df["period_label"] = period_df["period"].map(
+            {1: "1st", 2: "2nd", 3: "3rd", 4: "OT", 5: "SO"}
+        )
+        fig_period = px.bar(period_df, x="period_label", y="goal_pct",
+                            text="shots",
+                            labels={"period_label": "Period", "goal_pct": "Goal %"})
+        fig_period.update_layout(margin=dict(t=20, b=30), height=300)
+        st.plotly_chart(fig_period, use_container_width=True)
+
+    # -- Season-over-season shot volume --
+    with st.expander("Shots and goals by season"):
+        season_df = (
+            shots_df.groupby("season")
+            .agg(shots=("is_goal", "count"), goals=("is_goal", "sum"))
+            .reset_index()
+        )
+        season_df["goal_pct"] = (season_df["goals"] / season_df["shots"] * 100).round(2)
+        st.dataframe(season_df, use_container_width=True, hide_index=True)
+
+
+# ---------------------------------------------------------------------------
+# Tab 4 -- Edge Backtest
 # ---------------------------------------------------------------------------
 
 def backtest_view():
@@ -574,13 +960,15 @@ def backtest_view():
     # Pick primary market row per (player, game)
     odds_pick = _primary_market_rows(odds)
 
+    c1, c2 = st.columns([1, 3])
     model_versions = sorted(preds["model_version"].unique().tolist())
-    sel_model = st.selectbox(
-        "Model",
-        model_versions,
-        format_func=lambda m: MODEL_NAMES.get(m, m),
-        key="bt_model",
-    )
+    with c1:
+        sel_model = st.selectbox(
+            "Model",
+            model_versions,
+            format_func=lambda m: MODEL_NAMES.get(m, m),
+            key="bt_model",
+        )
 
     merged = (
         preds[preds["model_version"] == sel_model]
@@ -600,12 +988,12 @@ def backtest_view():
         (merged["predicted_probability"] - merged["market_implied"]) * 100
     )
 
-    # Edge threshold slider
-    min_edge = st.slider(
-        "Minimum edge (percentage points)",
-        min_value=-5.0, max_value=15.0, value=0.0, step=0.5,
-        key="bt_edge",
-    )
+    with c2:
+        min_edge = st.slider(
+            "Minimum edge (percentage points)",
+            min_value=-5.0, max_value=15.0, value=0.0, step=0.5,
+            key="bt_edge",
+        )
     bets = merged[merged["edge_pp"] >= min_edge].copy()
     if bets.empty:
         st.info(f"No bets at >= {min_edge:.1f}pp edge.")
@@ -656,7 +1044,7 @@ def backtest_view():
         margin=dict(t=20, b=30),
         height=350,
     )
-    st.plotly_chart(fig_pl, width='stretch')
+    st.plotly_chart(fig_pl, use_container_width=True)
 
     # Edge bucket performance
     bets["edge_bucket"] = pd.cut(
@@ -682,7 +1070,48 @@ def backtest_view():
         "avg_edge": "Avg edge",
     })
     st.markdown("**Performance by edge bucket**")
-    st.dataframe(bucket_stats, width='stretch', hide_index=True)
+    st.dataframe(bucket_stats, use_container_width=True, hide_index=True)
+
+    # Daily P/L
+    with st.expander("Daily P/L breakdown"):
+        daily = bets.groupby("game_date_d").agg(
+            bets=("scored", "count"),
+            wins=("scored", "sum"),
+            profit=("profit", "sum"),
+            avg_edge=("edge_pp", "mean"),
+        ).reset_index()
+        daily["cum_profit"] = daily["profit"].cumsum()
+        daily["roi"] = (daily["profit"] / daily["bets"] * 100).round(1)
+
+        fig_daily = go.Figure()
+        fig_daily.add_trace(go.Bar(
+            x=daily["game_date_d"],
+            y=daily["profit"],
+            name="Daily P/L",
+            marker_color=np.where(daily["profit"] >= 0, "#2ecc71", "#e74c3c"),
+        ))
+        fig_daily.add_trace(go.Scatter(
+            x=daily["game_date_d"],
+            y=daily["cum_profit"],
+            name="Cumulative",
+            mode="lines+markers",
+            yaxis="y2",
+        ))
+        fig_daily.update_layout(
+            yaxis=dict(title="Daily units"),
+            yaxis2=dict(title="Cumulative units", overlaying="y", side="right"),
+            margin=dict(t=20, b=30),
+            height=350,
+            legend=dict(x=0, y=1.1, orientation="h"),
+        )
+        st.plotly_chart(fig_daily, use_container_width=True)
+
+        daily_disp = daily.rename(columns={
+            "game_date_d": "Date", "bets": "Bets", "wins": "Wins",
+            "profit": "P/L", "avg_edge": "Avg Edge (pp)", "roi": "ROI %",
+            "cum_profit": "Cum P/L",
+        })
+        st.dataframe(daily_disp, use_container_width=True, hide_index=True)
 
     # Recent bets detail
     with st.expander("Recent bet detail (last 50)"):
@@ -705,7 +1134,123 @@ def backtest_view():
             "scored": "Scored?",
             "profit": "P/L",
         })
-        st.dataframe(disp, width='stretch', hide_index=True)
+        st.dataframe(disp, use_container_width=True, hide_index=True)
+
+
+# ---------------------------------------------------------------------------
+# Tab 5 -- Data Pipeline Status
+# ---------------------------------------------------------------------------
+
+def pipeline_status_view():
+    st.subheader("Data pipeline status")
+
+    engine = get_engine()
+
+    with engine.connect() as conn:
+        # Games coverage
+        games_by_season = conn.execute(sa_text("""
+            SELECT season,
+                   COUNT(*) as total,
+                   SUM(CASE WHEN game_state IN ('FINAL', 'OFF') THEN 1 ELSE 0 END) as completed
+            FROM games
+            WHERE game_type IN (2, 3)
+            GROUP BY season ORDER BY season
+        """)).fetchall()
+
+        # Shot events coverage
+        pbp_by_season = conn.execute(sa_text("""
+            SELECT g.season,
+                   COUNT(DISTINCT se.game_id) as games_with_pbp,
+                   COUNT(*) as total_shots
+            FROM shot_events se
+            JOIN games g ON se.game_id = g.game_id
+            GROUP BY g.season ORDER BY g.season
+        """)).fetchall()
+
+        # Player stats coverage
+        pgs_by_season = conn.execute(sa_text("""
+            SELECT g.season,
+                   COUNT(DISTINCT pgs.game_id) as games,
+                   COUNT(*) as player_game_rows
+            FROM player_game_stats pgs
+            JOIN games g ON pgs.game_id = g.game_id
+            GROUP BY g.season ORDER BY g.season
+        """)).fetchall()
+
+        # Predictions coverage
+        pred_by_season = conn.execute(sa_text("""
+            SELECT g.season,
+                   COUNT(DISTINCT mo.game_id) as games,
+                   COUNT(*) as predictions,
+                   COUNT(DISTINCT mo.model_version) as models
+            FROM model_outputs mo
+            JOIN games g ON mo.game_id = g.game_id
+            GROUP BY g.season ORDER BY g.season
+        """)).fetchall()
+
+        # Odds coverage
+        odds_stats = conn.execute(sa_text("""
+            SELECT COUNT(*) as total,
+                   COUNT(DISTINCT game_id) as games,
+                   MIN(retrieved_at) as first_capture,
+                   MAX(retrieved_at) as last_capture
+            FROM odds
+        """)).fetchone()
+
+        # Model files
+        model_files = list(MODEL_DIR.glob("*.pkl"))
+
+    # -- Games table --
+    st.markdown("**Games by season**")
+    games_df = pd.DataFrame(games_by_season, columns=["Season", "Total", "Completed"])
+    games_df["Split"] = games_df["Season"].map(lambda s: _split_label(int(s)))
+    st.dataframe(games_df, use_container_width=True, hide_index=True)
+
+    # -- PBP coverage --
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**Play-by-play (shot events) coverage**")
+        if pbp_by_season:
+            pbp_df = pd.DataFrame(pbp_by_season, columns=["Season", "Games w/ PBP", "Total Shots"])
+            st.dataframe(pbp_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No PBP data. Run backfill_pbp.")
+
+    with right:
+        st.markdown("**Player stats coverage**")
+        if pgs_by_season:
+            pgs_df = pd.DataFrame(pgs_by_season, columns=["Season", "Games", "Player-Game Rows"])
+            st.dataframe(pgs_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No player stats data.")
+
+    # -- Predictions + Odds + Models --
+    left2, mid2, right2 = st.columns(3)
+    with left2:
+        st.markdown("**Predictions**")
+        if pred_by_season:
+            pred_df = pd.DataFrame(pred_by_season, columns=["Season", "Games", "Predictions", "Models"])
+            st.dataframe(pred_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No predictions yet.")
+
+    with mid2:
+        st.markdown("**Odds data**")
+        if odds_stats and odds_stats[0] > 0:
+            st.metric("Total odds rows", f"{odds_stats[0]:,}")
+            st.metric("Games with odds", odds_stats[1])
+            st.metric("First capture", str(odds_stats[2])[:19] if odds_stats[2] else "N/A")
+            st.metric("Last capture", str(odds_stats[3])[:19] if odds_stats[3] else "N/A")
+        else:
+            st.info("No odds data captured yet.")
+
+    with right2:
+        st.markdown("**Saved models**")
+        for mf in sorted(model_files):
+            size_kb = mf.stat().st_size / 1024
+            st.text(f"{mf.name} ({size_kb:.0f} KB)")
+        if not model_files:
+            st.info("No saved models.")
 
 
 # ---------------------------------------------------------------------------
@@ -716,14 +1261,20 @@ def main():
     st.title("NHL Goal Probability Model")
     init_db()
 
-    tab1, tab2, tab3 = st.tabs(["Opportunities", "Diagnostics", "Backtest"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "Opportunities", "Model Diagnostics", "xG Model", "Backtest", "Pipeline Status"
+    ])
 
     with tab1:
         opportunities_view()
     with tab2:
         diagnostics_view()
     with tab3:
+        xg_diagnostics_view()
+    with tab4:
         backtest_view()
+    with tab5:
+        pipeline_status_view()
 
 
 if __name__ == "__main__":

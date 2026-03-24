@@ -202,6 +202,39 @@ class Odds(Base):
     game = relationship("Game")
 
 
+class ShotEvent(Base):
+    """Individual shot-level events from play-by-play data for xG modeling."""
+    __tablename__ = "shot_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    game_id = Column(Integer, ForeignKey("games.game_id"), nullable=False, index=True)
+    event_id = Column(Integer, nullable=False)
+    period = Column(Integer, nullable=False)
+    period_type = Column(String(5), nullable=False)        # REG, OT
+    time_in_period_seconds = Column(Integer, nullable=False)
+    event_type = Column(String(20), nullable=False)        # goal, shot-on-goal, missed-shot, blocked-shot
+    x_coord = Column(Float)
+    y_coord = Column(Float)
+    zone_code = Column(String(1))                          # O, D, N
+    shot_type = Column(String(20))                         # wrist, snap, slap, backhand, tip-in, deflected, wrap-around, poke
+    shooter_id = Column(Integer, ForeignKey("players.player_id"), nullable=False)
+    goalie_id = Column(Integer, ForeignKey("players.player_id"), nullable=True)  # NULL = empty net
+    team_id = Column(Integer, ForeignKey("teams.team_id"), nullable=False)
+    situation_code = Column(String(4))                     # e.g. 1551 = 5v5
+    is_goal = Column(Boolean, nullable=False, default=False)
+    distance = Column(Float)                               # feet from net center
+    angle = Column(Float)                                  # degrees from center line
+
+    __table_args__ = (
+        UniqueConstraint("game_id", "event_id", name="uq_shot_event_game_event"),
+    )
+
+    game = relationship("Game")
+    shooter = relationship("Player", foreign_keys=[shooter_id])
+    goalie = relationship("Player", foreign_keys=[goalie_id])
+    team = relationship("Team")
+
+
 class ModelOutput(Base):
     __tablename__ = "model_outputs"
 

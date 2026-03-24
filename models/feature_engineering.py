@@ -840,6 +840,166 @@ def build_feature_matrix_with_upcoming(seasons: list[int] = None) -> pd.DataFram
     return df
 
 
+def _xg_rolling_features(df: pd.DataFrame, windows: list[int]) -> pd.DataFrame:
+    """Add rolling xG-based features using pre-computed player-game xG totals.
+
+    Requires a trained xG model and shot_events data. Gracefully skips if
+    either is unavailable.
+    """
+    try:
+        from models.xg_model import compute_player_xg_totals, load_xg_model
+    except ImportError:
+        logger.info("xG model module not available, skipping xG features.")
+        return df
+
+    artifact = load_xg_model()
+    if artifact is None:
+        logger.info("No trained xG model found, skipping xG features.")
+        return df
+
+    logger.info("Computing player-game xG totals...")
+    player_xg = compute_player_xg_totals()
+    if player_xg.empty:
+        logger.info("No xG data available, skipping xG features.")
+        return df
+
+    # Merge xG totals onto df
+    xg_cols = ["xg_total", "xg_per_shot", "goals_above_expected"]
+    df = df.merge(
+        player_xg[["player_id", "game_id"] + xg_cols],
+        on=["player_id", "game_id"],
+        how="left",
+    )
+    for col in xg_cols:
+        df[col] = df[col].fillna(0)
+
+    # Also compute per-game shot count for xG context
+    shot_counts = player_xg[["player_id", "game_id", "shots"]].rename(
+        columns={"shots": "xg_shot_count"}
+    )
+    df = df.merge(shot_counts, on=["player_id", "game_id"], how="left")
+    df["xg_shot_count"] = df["xg_shot_count"].fillna(0)
+
+    # -----------------------------------------------------------------------
+    # Player-level rolling xG features
+    # -----------------------------------------------------------------------
+    df = df.sort_values(["player_id", "game_date", "game_id"]).copy()
+    grp = df.groupby("player_id")
+    new_cols = {}
+
+    for w in windows:
+        shifted_xg = grp["xg_total"].shift(1)
+        shifted_gae = grp["goals_above_expected"].shift(1)
+        shifted_xgps = grp["xg_per_shot"].shift(1)
+
+        new_cols[f"xg_total_avg_{w}g"] = (
+            shifted_xg.rolling(w, min_periods=1).mean().values
+        )
+        new_cols[f"goals_above_expected_avg_{w}g"] = (
+            shifted_gae.rolling(w, min_periods=1).mean().values
+        )
+        new_cols[f"xg_per_shot_avg_{w}g"] = (
+            shifted_xgps.rolling(w, min_periods=1).mean().values
+        )
+
+        shifted_toi = grp["toi_seconds"].shift(1)
+        xg_sum = shifted_xg.rolling(w, min_periods=1).sum()
+        toi_sum = shifted_toi.rolling(w, min_periods=1).sum()
+        new_cols[f"xg_per_60_{w}g"] = np.where(
+            toi_sum > 0, xg_sum / (toi_sum / 3600.0), 0.0
+        )
+
+        shifted_goals = grp["goals"].shift(1)
+        goals_sum = shifted_goals.rolling(w, min_periods=1).sum()
+        new_cols[f"finishing_pct_{w}g"] = np.where(
+            xg_sum > 0.5, goals_sum / xg_sum, 1.0
+        )
+
+        # xG trend: difference between short and long rolling avg
+        # (positive = xG increasing = player getting more/better chances)
+        if w >= 5:
+            short_xg = grp["xg_total"].shift(1).rolling(3, min_periods=1).mean()
+            long_xg = shifted_xg.rolling(w, min_periods=1).mean()
+            new_cols[f"xg_trend_{w}g"] = (short_xg - long_xg).values
+
+        # Finishing consistency: std dev of goals_above_expected
+        # (low = reliable finisher, high = streaky)
+        if w >= 5:
+            new_cols[f"gae_std_{w}g"] = (
+                shifted_gae.rolling(w, min_periods=3).std().fillna(0).values
+            )
+
+    # -----------------------------------------------------------------------
+    # Teammate xG quality: mean xG per game of teammates in same game
+    # (proxy for "how good is the offensive environment around this player")
+    # -----------------------------------------------------------------------
+    if "xg_total" in df.columns:
+        team_game_xg_sum = df.groupby(["game_id", "team_id"])["xg_total"].transform("sum")
+        team_game_xg_cnt = df.groupby(["game_id", "team_id"])["xg_total"].transform("count")
+        # Exclude self: (sum - self) / (count - 1)
+        denom = np.maximum(team_game_xg_cnt - 1, 1)
+        df["teammate_xg_avg"] = np.where(
+            team_game_xg_cnt > 1,
+            (team_game_xg_sum - df["xg_total"]) / denom,
+            0.0,
+        )
+        for w in windows:
+            shifted_tmxg = grp["teammate_xg_avg"].shift(1)
+            new_cols[f"teammate_xg_avg_{w}g"] = (
+                shifted_tmxg.rolling(w, min_periods=1).mean().values
+            )
+
+    # -----------------------------------------------------------------------
+    # Team-level xG against (opponent defensive weakness via xG allowed)
+    # Computed from all players in team_xg data
+    # -----------------------------------------------------------------------
+    # Aggregate xG allowed per team per game from the opposite side's shots
+    if "xg_total" in df.columns:
+        team_xg_for = (
+            df.groupby(["game_id", "team_id"])["xg_total"]
+            .sum()
+            .reset_index()
+            .rename(columns={"xg_total": "team_xg_for", "team_id": "_tid"})
+        )
+        # Map: opponent's xG for = this team's xG against
+        df = df.merge(
+            team_xg_for.rename(columns={"_tid": "opponent_team_id", "team_xg_for": "opp_xg_against"}),
+            on=["game_id", "opponent_team_id"],
+            how="left",
+        )
+        df["opp_xg_against"] = df["opp_xg_against"].fillna(0)
+
+        # Rolling opponent xG-against
+        df = df.sort_values(["player_id", "game_date", "game_id"]).copy()
+        grp = df.groupby("player_id")
+        for w in windows:
+            shifted_opp_xga = grp["opp_xg_against"].shift(1)
+            new_cols[f"opp_xg_against_avg_{w}g"] = (
+                shifted_opp_xga.rolling(w, min_periods=1).mean().values
+            )
+
+    # -----------------------------------------------------------------------
+    # Interaction: player xG ability x opponent xG weakness
+    # -----------------------------------------------------------------------
+    for w in [10, 20]:
+        xg60_col = f"xg_per_60_{w}g"
+        opp_xga_col = f"opp_xg_against_avg_{w}g"
+        if xg60_col in new_cols and opp_xga_col in new_cols:
+            new_cols[f"xg60_x_opp_xga_{w}g"] = (
+                new_cols[xg60_col] * new_cols[opp_xga_col]
+            )
+
+    df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
+
+    # Clean up intermediate columns
+    drop_cols = [c for c in ("xg_total", "xg_per_shot", "goals_above_expected",
+                              "xg_shot_count", "teammate_xg_avg", "opp_xg_against")
+                 if c in df.columns]
+    df.drop(columns=drop_cols, inplace=True, errors="ignore")
+
+    return df
+
+
 def _run_full_feature_pipeline(
     df: pd.DataFrame, tables: dict, windows: list[int]
 ) -> pd.DataFrame:
@@ -888,6 +1048,9 @@ def _run_full_feature_pipeline(
 
     logger.info("Computing interaction features...")
     df = _interaction_features(df)
+
+    logger.info("Computing xG rolling features...")
+    df = _xg_rolling_features(df, windows)
 
     return df
 
