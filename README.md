@@ -10,13 +10,15 @@ The goal is straightforward: if our model thinks a player has a 25% chance to sc
 
 1. **Data collection** -- Two NHL APIs provide game schedules, boxscores, play-by-play shot data, and advanced stats (Corsi, Fenwick, zone starts, PP deployment, etc.) going back to the 2020-21 season. The Odds API provides FanDuel player prop lines for today's games.
 
-2. **Feature engineering** -- For each (player, game) row, the pipeline computes ~309 features: rolling averages across 3/5/10/20-game windows, season-to-date stats, opponent defensive quality, goalie performance, schedule context (rest days, back-to-backs), home/road splits, streak indicators, and interaction terms. All features are strictly causal (no future data leakage).
+2. **xG model** -- A shot-level LightGBM classifier is trained on ~896K play-by-play shot events to predict the probability of each shot becoming a goal. Shootout attempts are excluded (they are not legitimate gameplay). The xG model's per-player-per-game outputs become rolling features for the main models.
 
-3. **Model training** -- Three models are trained on seasons 2020-21 through 2023-24, validated on 2024-25, and tested on 2025-26 (the current season). Time-decay weighting gives recent games more influence. LightGBM can be Optuna-tuned with rolling temporal cross-validation. Calibration is applied post-training (Platt scaling for LR, isotonic regression for tree models).
+3. **Feature engineering** -- For each (player, game) row, the pipeline computes 345 features: rolling averages across 3/5/10/20-game windows, xG-derived metrics (xG/60, goals above expected, finishing %, xG trend), season-to-date stats, opponent defensive quality, goalie performance, schedule context (rest days, back-to-backs), home/road splits, streak indicators, and interaction terms. All features are strictly causal (no future data leakage).
 
-4. **Daily predictions** -- A scheduler script fetches today's games, enriches them with advanced stats, pulls FanDuel odds, generates predictions for all three models, and stores everything in SQLite.
+4. **Model training** -- Three models are trained on seasons 2020-21 through 2023-24, validated on 2024-25, and tested on 2025-26 (the current season). Time-decay weighting gives recent games more influence. LightGBM can be Optuna-tuned with rolling temporal cross-validation. Calibration is applied post-training (Platt scaling for LR, isotonic regression for tree models).
 
-5. **Dashboard** -- A Streamlit app shows today's slate with model probabilities, FanDuel implied probabilities, and the edge (model % - market %) for each player. It also has diagnostics and backtest tabs.
+5. **Daily predictions** -- A scheduler script fetches today's games, enriches them with advanced stats, ingests play-by-play shot events, pulls FanDuel odds, generates predictions for all three models, and stores everything in SQLite.
+
+6. **Dashboard** -- A Streamlit app with five tabs: Opportunities (today's slate with edges), Model Diagnostics (calibration curves, lift tables, feature importance), xG Model (shot-level analysis), Backtest (simulated P&L), and Pipeline Status (data coverage).
 
 ---
 
@@ -143,7 +145,7 @@ nhl_forecasting/
 |   |-- nhl_forecasting.db       # SQLite database (all game data, odds, predictions)
 |
 |-- database/
-|   |-- models.py                # SQLAlchemy ORM (Teams, Players, Games, Stats, Odds, ModelOutput)
+|   |-- models.py                # SQLAlchemy ORM (Teams, Players, Games, Stats, Odds, ShotEvent, ModelOutput)
 |   |-- db_client.py             # Engine/session factory (SQLite with WAL mode)
 |   |-- ingestion.py             # Upsert helpers for idempotent data loading
 |   |-- migrate_add_stats_columns.py  # Adds Stats API enrichment columns to existing DBs
@@ -151,9 +153,9 @@ nhl_forecasting/
 |-- scrapers/
 |   |-- nhl_api/                 # NHL Web API (api-web.nhle.com)
 |   |   |-- client.py            # Schedule, boxscore, roster, play-by-play endpoints
-|   |   |-- parsers.py           # Parse boxscore JSON into player/goalie/team stats
+|   |   |-- parsers.py           # Parse boxscore/PBP JSON into player/goalie/team/shot stats
 |   |   |-- backfill.py          # Bulk historical data ingestion
-|   |   |-- backfill_pbp.py     # Resume-aware play-by-play shot event backfill
+|   |   |-- backfill_pbp.py      # Resume-aware play-by-play shot event backfill
 |   |   |-- fetch_missing_boxscores.py
 |   |   |-- refresh_rosters.py
 |   |
@@ -167,7 +169,7 @@ nhl_forecasting/
 |       |-- odds_matching.py     # Fuzzy name matching between Odds API and NHL DB
 |
 |-- models/
-|   |-- feature_engineering.py   # ~350 features: rolling stats, xG, opponent quality, context, etc.
+|   |-- feature_engineering.py   # 345 features: rolling stats, xG, opponent quality, context, etc.
 |   |-- xg_model.py             # Expected goals model (shot-level LightGBM classifier)
 |   |-- training.py              # Train LR/LGB/XGB with calibration and time-decay weights
 |   |-- inference.py             # Load models, score today's games, store predictions
@@ -180,7 +182,7 @@ nhl_forecasting/
 |   |-- daily_job.py             # Orchestrates the full daily pipeline
 |
 |-- streamlit/
-|   |-- app.py                   # Dashboard: Opportunities, Diagnostics, Backtest tabs
+|   |-- app.py                   # Dashboard: Opportunities, Diagnostics, xG, Backtest, Pipeline
 |
 |-- utils/
 |   |-- config.py                # YAML config loader with .env support
@@ -193,25 +195,42 @@ nhl_forecasting/
 
 | Model | Role | Calibration | Notes |
 |-------|------|-------------|-------|
-| **Logistic Regression** | Baseline | Platt scaling (CV out-of-fold on training logits) | L1 regularization auto-selects ~266 of 309 features. Predictions clipped to 2-45% as a safety net for OOD inputs. Conservative but stable. |
+| **Logistic Regression** | Baseline | Platt scaling (CV out-of-fold on training logits) | L1 regularization auto-selects ~287 of 345 features. Predictions clipped to 2-45% as a safety net for OOD inputs. Conservative but stable. |
 | **LightGBM** | Primary | Isotonic regression on validation set | Optuna-tunable. Default params produce predictions tightly concentrated near the 15% base rate; tuning widens the spread. |
 | **XGBoost** | Primary | Isotonic regression on validation set | Best raw performance (lowest logloss, highest AUC). Predictions track FanDuel lines closely on out-of-sample data. |
 
-### Test season performance (2025-26, 40K out-of-sample predictions)
+### Validation performance (2024-25, 50K out-of-sample predictions)
 
-| Model | Logloss | AUC | Mean Pred | Base Rate |
-|-------|---------|-----|-----------|-----------|
-| LR | 0.398 | 0.689 | 0.134 | 0.151 |
-| LGB (default) | 0.396 | 0.694 | 0.145 | 0.151 |
-| XGB | 0.395 | 0.695 | 0.143 | 0.151 |
+| Model | Log Loss | AUC | Mean Pred | Base Rate |
+|-------|----------|-----|-----------|-----------|
+| LR | 0.3888 | 0.706 | 0.139 | 0.150 |
+| LGB | 0.3871 | 0.708 | 0.150 | 0.150 |
+| XGB | 0.3862 | 0.710 | 0.150 | 0.150 |
 
-These are honest out-of-sample numbers -- the test season was never seen during training or validation.
+All three models show monotonic calibration (actual scoring rates increase strictly across all prediction deciles). XGBoost has the best discrimination (AUC 0.710) and calibration. LightGBM and XGBoost both nail the base rate exactly (mean pred = actual rate).
+
+### Top features driving predictions (LightGBM gain)
+
+The xG features dominate, confirming the value of the shot-level model:
+
+1. `xg_total_avg_20g` -- 20-game rolling xG total (by far #1)
+2. `xg_total_avg_10g` -- 10-game rolling xG total
+3. `xg_total_avg_5g` -- 5-game rolling xG total
+4. `pp_toi_share_of_team_20g` -- share of team's power play time
+5. `position_code` -- forward vs defenseman
+6. `season_scoring_rate` -- season-to-date goal frequency
+7. `opp_sa_avg_20g` -- opponent shots against (defensive weakness)
+8. `toi_seconds_avg_3g` -- recent ice time
+9. `xg_per_60_20g` -- xG rate per 60 minutes
+10. `season_goals_per_60` -- season goal rate per 60
 
 ---
 
 ## Expected Goals (xG) model
 
 The xG model is a shot-level LightGBM binary classifier that predicts the probability of each shot becoming a goal. It uses play-by-play data from the NHL API and feeds into the main goal-scoring models as features.
+
+**Important:** Shootout attempts are excluded from all xG training and inference. Shootouts are a skills competition, not legitimate gameplay -- their ~32% conversion rate would heavily distort a model trained on regular play (~5% goal rate). Penalty shots during regulation/overtime are included since they occur during normal gameplay.
 
 ### xG shot features
 
@@ -220,7 +239,17 @@ The xG model is a shot-level LightGBM binary classifier that predicts the probab
 - **Game state** -- period, time in period, overtime flag, score differential (trailing/tied/leading), strength state (PP/SH/5v5), empty net
 - **Shot sequence** -- time since last shot (any team), rebound (shot within 3s of prior), rush (3-5s), same-team prior shot (sustained pressure), prior shot was a goal, distance/angle change from prior shot, shots in last 10 seconds (flurry)
 
-The xG model is trained once on all available shot data, calibrated via isotonic regression on a validation season, and saved to `models/saved/xg_model.pkl`.
+### xG model performance (896K shots, 7,670 games, shootouts excluded)
+
+| Split | AUC | LogLoss | Brier | Mean Pred | Actual Rate |
+|-------|-----|---------|-------|-----------|-------------|
+| Train (598K shots, 2020-24) | 0.841 | 0.162 | 0.044 | 5.10% | 5.28% |
+| Val (167K shots, 2024-25) | 0.840 | 0.157 | 0.043 | 5.05% | 5.05% |
+| Test (131K shots, 2025-26) | 0.831 | 0.164 | 0.044 | 5.29% | 5.24% |
+
+These are strong numbers for xG -- comparable to public models like MoneyPuck. The near-zero train-val gap (0.841 vs 0.840 AUC) shows the model generalizes well. Calibration is tight: predicted and actual goal rates are nearly identical on validation (5.05% vs 5.05%).
+
+Top features: shot distance, shot type, empty net, offensive zone indicator, distance-angle interaction, goalie absent, rebounds.
 
 ### xG features in the main models
 
@@ -239,7 +268,7 @@ Per-player-per-game xG totals are aggregated and turned into rolling features at
 
 ## Feature overview
 
-The ~350 features fall into these groups:
+The 345 features fall into these groups:
 
 - **Rolling player stats** (4 windows: 3/5/10/20 games) -- goals, assists, shots, TOI, PP time, Corsi/Fenwick, zone starts, shooting %, etc.
 - **xG-derived** (4 windows) -- xG totals, xG/60, goals above expected, finishing %, xG trend, teammate/opponent xG context
@@ -264,15 +293,23 @@ All features use a `shift(1)` offset so they only reflect information available 
 
 ### Opportunities
 
-The main view. Shows today's slate with each player's predicted probability from all three models, the FanDuel line (American odds and implied probability), and the edge for each model. Filter by date, team, or position. The summary bar shows total players on the slate, number of +EV plays, and the best edge available.
+The main view. Shows today's slate with each player's predicted probability from all three models, the FanDuel line (American odds and implied probability), and the edge for each model. Filter by date, game, team, position, or model. Includes a model consensus column showing how many models agree on +EV, and a model agreement scatter plot.
 
-### Diagnostics
+### Model Diagnostics
 
-Model evaluation across seasons. Shows logloss, Brier score, AUC, calibration curves, and lift tables. Includes a train/val/test season selector so you can verify the model isn't just memorizing training data.
+Model evaluation across seasons. Shows logloss, Brier score, AUC, calibration curves, lift tables, prediction distributions, per-position performance breakdown, and feature importance charts. Includes a train/val/test season selector so you can verify the model isn't just memorizing training data.
+
+### xG Model
+
+Shot-level diagnostics: xG model performance metrics, feature importance, goal rate by shot type and game situation, goal rate vs distance and angle curves, shot location heatmap, period breakdown, and season-over-season shot volume.
 
 ### Backtest
 
-Simulates flat-stake betting on historical +EV plays. Adjust the edge threshold to see ROI, cumulative P&L, and performance by edge bucket.
+Simulates flat-stake betting on historical +EV plays. Adjust the edge threshold to see ROI, cumulative P&L, daily P&L breakdown, and performance by edge bucket.
+
+### Pipeline Status
+
+Data coverage dashboard showing games, play-by-play, player stats, predictions, and odds coverage by season. Shows saved model files and their sizes. Useful for diagnosing missing data.
 
 ---
 
@@ -299,7 +336,7 @@ The implied probability is `1 / decimal_odds` or the standard American-to-implie
 
 ## Retraining the xG model
 
-The xG model trains on shot-level play-by-play data and should be retrained when you have significantly more data (e.g., a new season). Retraining is quick (under a minute on ~800K shots).
+The xG model trains on shot-level play-by-play data and should be retrained when you have significantly more data (e.g., a new season). Retraining is quick (under a minute on ~900K shots).
 
 ```bash
 # 1. Make sure PBP data is up to date (resume-aware, safe to re-run)
@@ -312,20 +349,6 @@ python -m models.xg_model
 python models/run_training.py --no-tune    # quick
 python models/run_training.py              # with Optuna tuning (slower, better)
 ```
-
-The xG model will print AUC, log loss, and Brier score for train/val/test splits, plus the top 15 most important features.
-
-### xG model performance (900K shots, 7,669 games)
-
-| Split | AUC | LogLoss | Brier | Mean Pred | Actual Rate |
-|-------|-----|---------|-------|-----------|-------------|
-| Train (600K shots, 2020-24) | 0.843 | 0.164 | 0.045 | 5.22% | 5.39% |
-| Val (168K shots, 2024-25) | 0.842 | 0.158 | 0.043 | 5.13% | 5.13% |
-| Test (131K shots, 2025-26) | 0.834 | 0.166 | 0.045 | 5.41% | 5.38% |
-
-These are strong numbers for xG -- comparable to public models like MoneyPuck. The near-zero train-val gap (0.843 vs 0.842 AUC) shows the model generalizes well. Calibration is tight: predicted and actual goal rates differ by less than 0.2 percentage points across all splits.
-
-Top features: shot distance, shot type, offensive zone indicator, empty net, distance-angle interaction, rebounds, and shot flurries.
 
 ### New season checklist
 
@@ -362,7 +385,7 @@ At the start of a new NHL season:
 ## Notes
 
 - The database is SQLite with WAL journaling. It lives at `data/nhl_forecasting.db` by default.
-- Only regular season (game_type=2) and playoff (game_type=3) games are used. Preseason is filtered out.
+- Only regular season (game_type=2) and playoff (game_type=3) games are used. Preseason and shootouts are filtered out.
 - The daily job only generates predictions for today's date to avoid stale rolling features for future games.
 - Model pickles include the feature column list, scaler (LR only), and calibrator. If you change the feature engineering code, you must retrain.
 - The Stats API enrichment and PBP backfill are both resume-aware. If interrupted, just run them again and they'll pick up where they left off.

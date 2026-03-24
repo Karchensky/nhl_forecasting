@@ -142,6 +142,7 @@ def load_shot_events_summary():
         FROM shot_events se
         JOIN games g ON se.game_id = g.game_id
         WHERE g.game_state IN ('FINAL', 'OFF')
+          AND se.period_type != 'SO'
     """
     return pd.read_sql(query, engine)
 
@@ -394,7 +395,7 @@ def opportunities_view():
         "away_team": "Away",
     })
 
-    st.dataframe(display, use_container_width=True, hide_index=True, height=600)
+    st.dataframe(display, width='stretch', hide_index=True, height=600)
 
     # -- Expanders --
     with st.expander("Prediction distributions"):
@@ -414,7 +415,7 @@ def opportunities_view():
                 margin=dict(t=30, b=30),
                 height=300,
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
     with st.expander("Model agreement scatter"):
         if len(model_prob_cols) >= 2:
@@ -442,7 +443,7 @@ def opportunities_view():
                 margin=dict(t=20, b=30),
                 height=350,
             )
-            st.plotly_chart(fig_scatter, use_container_width=True)
+            st.plotly_chart(fig_scatter, width='stretch')
         else:
             st.info("Need at least 2 models for agreement scatter.")
 
@@ -528,7 +529,7 @@ def diagnostics_view():
             "Pred/Base": round(m["mean_predicted"] / max(m["base_rate"], 1e-6), 3),
         })
     if comp_rows:
-        st.dataframe(pd.DataFrame(comp_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(comp_rows), width='stretch', hide_index=True)
     else:
         st.warning("No overlapping predictions and results for selected seasons.")
         return
@@ -584,7 +585,7 @@ def diagnostics_view():
             height=350,
             showlegend=True,
         )
-        st.plotly_chart(fig_cal, use_container_width=True)
+        st.plotly_chart(fig_cal, width='stretch')
 
     with right:
         st.markdown("**Lift by decile**")
@@ -597,7 +598,7 @@ def diagnostics_view():
             margin=dict(t=20, b=30),
             height=350,
         )
-        st.plotly_chart(fig_lift, use_container_width=True)
+        st.plotly_chart(fig_lift, width='stretch')
 
     # -- Calibration table + cumulative gains --
     left2, right2 = st.columns(2)
@@ -607,7 +608,7 @@ def diagnostics_view():
         cal_d["actual_rate"] = (cal_d["actual_rate"] * 100).round(2)
         cal_d["predicted_mean"] = (cal_d["predicted_mean"] * 100).round(2)
         cal_d["abs_error"] = cal_d["abs_error"].round(4)
-        st.dataframe(cal_d, use_container_width=True, hide_index=True)
+        st.dataframe(cal_d, width='stretch', hide_index=True)
 
     with right2:
         st.markdown("**Cumulative gains**")
@@ -618,7 +619,7 @@ def diagnostics_view():
             margin=dict(t=20, b=30),
             height=300,
         )
-        st.plotly_chart(fig_gains, use_container_width=True)
+        st.plotly_chart(fig_gains, width='stretch')
 
     # -- Prediction distribution overlay --
     st.markdown("**Prediction distribution (all models)**")
@@ -640,7 +641,7 @@ def diagnostics_view():
         margin=dict(t=20, b=30),
         height=300,
     )
-    st.plotly_chart(fig_dist, use_container_width=True)
+    st.plotly_chart(fig_dist, width='stretch')
 
     # -- Per-position breakdown --
     with st.expander("Performance by position"):
@@ -666,7 +667,7 @@ def diagnostics_view():
                     "Brier": f"{m['brier_score']:.4f}",
                 })
             if rows_pos:
-                st.dataframe(pd.DataFrame(rows_pos), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(rows_pos), width='stretch', hide_index=True)
             else:
                 st.info("Not enough data per position group.")
 
@@ -702,7 +703,7 @@ def diagnostics_view():
                     margin=dict(t=20, b=30, l=200),
                     height=max(400, len(imp_df) * 18),
                 )
-                st.plotly_chart(fig_imp, use_container_width=True)
+                st.plotly_chart(fig_imp, width='stretch')
             else:
                 st.info("Could not extract feature importances for this model type.")
         else:
@@ -752,7 +753,7 @@ def xg_diagnostics_view():
                 "Brier": round(r["brier"], 4),
             })
     if perf_rows:
-        st.dataframe(pd.DataFrame(perf_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(perf_rows), width='stretch', hide_index=True)
     else:
         st.warning("No evaluation results stored in xG model artifact.")
 
@@ -771,7 +772,7 @@ def xg_diagnostics_view():
             margin=dict(t=20, b=30, l=180),
             height=max(400, len(imp_df) * 20),
         )
-        st.plotly_chart(fig_imp, use_container_width=True)
+        st.plotly_chart(fig_imp, width='stretch')
 
     # -- Shot data analysis --
     shots_df = load_shot_events_summary()
@@ -812,7 +813,7 @@ def xg_diagnostics_view():
             margin=dict(t=20, b=30, l=120),
             height=350,
         )
-        st.plotly_chart(fig_st, use_container_width=True)
+        st.plotly_chart(fig_st, width='stretch')
 
     with right:
         st.markdown("**Goal rate by game situation**")
@@ -842,7 +843,7 @@ def xg_diagnostics_view():
             margin=dict(t=20, b=30, l=120),
             height=350,
         )
-        st.plotly_chart(fig_sit, use_container_width=True)
+        st.plotly_chart(fig_sit, width='stretch')
 
     # -- Distance/angle vs goal rate --
     left2, right2 = st.columns(2)
@@ -862,7 +863,7 @@ def xg_diagnostics_view():
                            labels={"distance": "Distance (ft)", "goal_pct": "Goal %"},
                            markers=True)
         fig_dist.update_layout(margin=dict(t=20, b=30), height=300)
-        st.plotly_chart(fig_dist, use_container_width=True)
+        st.plotly_chart(fig_dist, width='stretch')
 
     with right2:
         st.markdown("**Goal rate by angle**")
@@ -880,7 +881,7 @@ def xg_diagnostics_view():
                             labels={"angle": "Angle (degrees)", "goal_pct": "Goal %"},
                             markers=True)
         fig_angle.update_layout(margin=dict(t=20, b=30), height=300)
-        st.plotly_chart(fig_angle, use_container_width=True)
+        st.plotly_chart(fig_angle, width='stretch')
 
     # -- Shot location heatmap --
     with st.expander("Shot location heatmap"):
@@ -903,7 +904,7 @@ def xg_diagnostics_view():
             height=400,
             width=600,
         )
-        st.plotly_chart(fig_heat, use_container_width=True)
+        st.plotly_chart(fig_heat, width='stretch')
 
     # -- Per-period goal rate --
     with st.expander("Goal rate by period"):
@@ -921,7 +922,7 @@ def xg_diagnostics_view():
                             text="shots",
                             labels={"period_label": "Period", "goal_pct": "Goal %"})
         fig_period.update_layout(margin=dict(t=20, b=30), height=300)
-        st.plotly_chart(fig_period, use_container_width=True)
+        st.plotly_chart(fig_period, width='stretch')
 
     # -- Season-over-season shot volume --
     with st.expander("Shots and goals by season"):
@@ -931,7 +932,7 @@ def xg_diagnostics_view():
             .reset_index()
         )
         season_df["goal_pct"] = (season_df["goals"] / season_df["shots"] * 100).round(2)
-        st.dataframe(season_df, use_container_width=True, hide_index=True)
+        st.dataframe(season_df, width='stretch', hide_index=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1044,7 +1045,7 @@ def backtest_view():
         margin=dict(t=20, b=30),
         height=350,
     )
-    st.plotly_chart(fig_pl, use_container_width=True)
+    st.plotly_chart(fig_pl, width='stretch')
 
     # Edge bucket performance
     bets["edge_bucket"] = pd.cut(
@@ -1070,7 +1071,7 @@ def backtest_view():
         "avg_edge": "Avg edge",
     })
     st.markdown("**Performance by edge bucket**")
-    st.dataframe(bucket_stats, use_container_width=True, hide_index=True)
+    st.dataframe(bucket_stats, width='stretch', hide_index=True)
 
     # Daily P/L
     with st.expander("Daily P/L breakdown"):
@@ -1104,14 +1105,14 @@ def backtest_view():
             height=350,
             legend=dict(x=0, y=1.1, orientation="h"),
         )
-        st.plotly_chart(fig_daily, use_container_width=True)
+        st.plotly_chart(fig_daily, width='stretch')
 
         daily_disp = daily.rename(columns={
             "game_date_d": "Date", "bets": "Bets", "wins": "Wins",
             "profit": "P/L", "avg_edge": "Avg Edge (pp)", "roi": "ROI %",
             "cum_profit": "Cum P/L",
         })
-        st.dataframe(daily_disp, use_container_width=True, hide_index=True)
+        st.dataframe(daily_disp, width='stretch', hide_index=True)
 
     # Recent bets detail
     with st.expander("Recent bet detail (last 50)"):
@@ -1134,7 +1135,7 @@ def backtest_view():
             "scored": "Scored?",
             "profit": "P/L",
         })
-        st.dataframe(disp, use_container_width=True, hide_index=True)
+        st.dataframe(disp, width='stretch', hide_index=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1204,7 +1205,7 @@ def pipeline_status_view():
     st.markdown("**Games by season**")
     games_df = pd.DataFrame(games_by_season, columns=["Season", "Total", "Completed"])
     games_df["Split"] = games_df["Season"].map(lambda s: _split_label(int(s)))
-    st.dataframe(games_df, use_container_width=True, hide_index=True)
+    st.dataframe(games_df, width='stretch', hide_index=True)
 
     # -- PBP coverage --
     left, right = st.columns(2)
@@ -1212,7 +1213,7 @@ def pipeline_status_view():
         st.markdown("**Play-by-play (shot events) coverage**")
         if pbp_by_season:
             pbp_df = pd.DataFrame(pbp_by_season, columns=["Season", "Games w/ PBP", "Total Shots"])
-            st.dataframe(pbp_df, use_container_width=True, hide_index=True)
+            st.dataframe(pbp_df, width='stretch', hide_index=True)
         else:
             st.info("No PBP data. Run backfill_pbp.")
 
@@ -1220,7 +1221,7 @@ def pipeline_status_view():
         st.markdown("**Player stats coverage**")
         if pgs_by_season:
             pgs_df = pd.DataFrame(pgs_by_season, columns=["Season", "Games", "Player-Game Rows"])
-            st.dataframe(pgs_df, use_container_width=True, hide_index=True)
+            st.dataframe(pgs_df, width='stretch', hide_index=True)
         else:
             st.info("No player stats data.")
 
@@ -1230,7 +1231,7 @@ def pipeline_status_view():
         st.markdown("**Predictions**")
         if pred_by_season:
             pred_df = pd.DataFrame(pred_by_season, columns=["Season", "Games", "Predictions", "Models"])
-            st.dataframe(pred_df, use_container_width=True, hide_index=True)
+            st.dataframe(pred_df, width='stretch', hide_index=True)
         else:
             st.info("No predictions yet.")
 

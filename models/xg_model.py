@@ -82,6 +82,7 @@ def _load_shot_data() -> pd.DataFrame:
         JOIN games g ON se.game_id = g.game_id
         WHERE g.game_state IN ('FINAL', 'OFF')
           AND g.game_type IN (2, 3)
+          AND se.period_type != 'SO'
         ORDER BY g.game_date, se.game_id, se.event_id
     """
     df = pd.read_sql(query, engine)
@@ -403,6 +404,7 @@ def compute_player_xg_totals(season: int | None = None) -> pd.DataFrame:
         JOIN games g ON se.game_id = g.game_id
         WHERE g.game_state IN ('FINAL', 'OFF')
           AND g.game_type IN (2, 3)
+          AND se.period_type != 'SO'
           {season_filter}
         ORDER BY g.game_date, se.game_id, se.event_id
     """

@@ -291,6 +291,11 @@ def parse_play_by_play(data: dict, game_id: int) -> list[dict]:
         details = play.get("details", {})
         period_desc = play.get("periodDescriptor", {})
 
+        # Skip shootout attempts -- they are not legitimate gameplay shots.
+        # Penalty shots during regulation/OT are fine (period_type != "SO").
+        if period_desc.get("periodType") == "SO":
+            continue
+
         x = details.get("xCoord")
         y = details.get("yCoord")
         distance, angle = _compute_distance_and_angle(x, y)
