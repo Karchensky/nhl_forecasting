@@ -259,11 +259,12 @@ def opportunities_view():
         work = work[work["position"].isin(pos_pick)]
 
     all_models = sorted(work["model_version"].unique().tolist())
+    default_models = [m for m in all_models if m != "logistic_regression"] or all_models
     with c5:
         model_pick = st.multiselect(
             "Models",
             options=all_models,
-            default=all_models,
+            default=default_models,
             format_func=lambda m: MODEL_NAMES.get(m, m),
             key="opp_models",
         )
@@ -331,12 +332,17 @@ def opportunities_view():
 
     wide["Avg model line"] = wide["_avg_model_p"].map(_line_from_p)
 
+    # Average edge across selected models
     if edge_cols:
-        mat = wide[edge_cols].to_numpy(dtype=float)
+        edge_mat = wide[edge_cols].to_numpy(dtype=float)
+        wide["Avg edge %"] = np.round(np.nanmean(
+            np.where(np.isfinite(edge_mat), edge_mat, np.nan), axis=1
+        ), 2)
         wide["_best_edge"] = np.nanmax(
-            np.where(np.isfinite(mat), mat, np.nan), axis=1
+            np.where(np.isfinite(edge_mat), edge_mat, np.nan), axis=1
         )
     else:
+        wide["Avg edge %"] = np.nan
         wide["_best_edge"] = np.nan
 
     # Model consensus: how many models agree on +EV
@@ -381,9 +387,9 @@ def opportunities_view():
         ["Rank", "Team rank", "player_name", "position", "player_team",
          "home_team", "away_team"]
         + [MODEL_DISPLAY[m][0] for m in model_pick if m in wide.columns]
-        + ["FD Line", "FD %"]
+        + ["FD %", "FD Line", "Avg model line"]
         + [MODEL_DISPLAY[m][1] for m in model_pick if m in wide.columns]
-        + ["Consensus", "Avg model line"]
+        + ["Avg edge %", "Consensus"]
     )
     out_cols = [c for c in out_cols if c in wide.columns]
     display = wide[out_cols].copy()

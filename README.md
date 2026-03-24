@@ -203,11 +203,11 @@ nhl_forecasting/
 
 | Model | Log Loss | AUC | Mean Pred | Base Rate |
 |-------|----------|-----|-----------|-----------|
-| LR | 0.3888 | 0.706 | 0.139 | 0.150 |
-| LGB | 0.3871 | 0.708 | 0.150 | 0.150 |
-| XGB | 0.3862 | 0.710 | 0.150 | 0.150 |
+| LR | 0.3888 | 0.705 | 0.140 | 0.150 |
+| LGB | 0.3861 | 0.710 | 0.150 | 0.150 |
+| XGB | 0.3865 | 0.709 | 0.150 | 0.150 |
 
-All three models show monotonic calibration (actual scoring rates increase strictly across all prediction deciles). XGBoost has the best discrimination (AUC 0.710) and calibration. LightGBM and XGBoost both nail the base rate exactly (mean pred = actual rate).
+All three models show monotonic calibration (actual scoring rates increase strictly across all prediction deciles). LightGBM has the best discrimination (AUC 0.710) and calibration. LightGBM and XGBoost both nail the base rate exactly (mean pred = actual rate).
 
 ### Top features driving predictions (LightGBM gain)
 
@@ -215,14 +215,14 @@ The xG features dominate, confirming the value of the shot-level model:
 
 1. `xg_total_avg_20g` -- 20-game rolling xG total (by far #1)
 2. `xg_total_avg_10g` -- 10-game rolling xG total
-3. `xg_total_avg_5g` -- 5-game rolling xG total
-4. `pp_toi_share_of_team_20g` -- share of team's power play time
-5. `position_code` -- forward vs defenseman
-6. `season_scoring_rate` -- season-to-date goal frequency
-7. `opp_sa_avg_20g` -- opponent shots against (defensive weakness)
-8. `toi_seconds_avg_3g` -- recent ice time
-9. `xg_per_60_20g` -- xG rate per 60 minutes
-10. `season_goals_per_60` -- season goal rate per 60
+3. `season_scoring_rate` -- season-to-date goal frequency
+4. `xg_total_avg_5g` -- 5-game rolling xG total
+5. `xg_per_60_20g` -- xG rate per 60 minutes
+6. `position_code` -- forward vs defenseman
+7. `pp_toi_share_of_team_20g` -- share of team's power play time
+8. `shots_avg_20g` -- 20-game rolling shot volume
+9. `pp_toi_share_of_team_5g` -- recent PP deployment share
+10. `toi_seconds_avg_20g` -- 20-game rolling ice time
 
 ---
 
